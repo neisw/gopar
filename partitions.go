@@ -60,6 +60,67 @@ type RetentionSummary struct {
 	NewestPartition    string
 }
 
+// PartitionLevel represents the depth in a partition hierarchy
+type PartitionLevel int
+
+const (
+	PartitionLevelRoot PartitionLevel = 0 // The parent partitioned table
+	PartitionLevel1    PartitionLevel = 1 // First level partitions
+	PartitionLevel2    PartitionLevel = 2 // Second level partitions (sub-partitions)
+	PartitionLevel3    PartitionLevel = 3 // Third level partitions
+)
+
+// PartitionHierarchyInfo holds metadata about a partition in a hierarchy
+type PartitionHierarchyInfo struct {
+	TableName       string         // Name of this partition
+	ParentTable     string         // Name of parent table/partition
+	Level           PartitionLevel // Depth in hierarchy (0 = root table)
+	IsLeaf          bool           // True if this partition can hold data
+	IsPartitioned   bool           // True if this partition is further sub-partitioned
+	Strategy        string         // Partitioning strategy at this level (RANGE, LIST, HASH)
+	PartitionKey    string         // Column(s) partitioned on
+	Children        []string       // Names of child partitions
+	PartitionBounds string         // FOR VALUES clause for this partition
+
+	// For time-based partitions
+	PartitionDate *time.Time // Date for time-based partitions (if applicable)
+
+	// Size information
+	SizeBytes   int64
+	SizePretty  string
+	RowEstimate int64
+}
+
+// PartitionGranularity defines the time granularity for RANGE partitioning
+type PartitionGranularity string
+
+const (
+	GranularityYearly  PartitionGranularity = "YEARLY"
+	GranularityMonthly PartitionGranularity = "MONTHLY"
+	GranularityDaily   PartitionGranularity = "DAILY"
+	GranularityHourly  PartitionGranularity = "HOURLY"
+)
+
+// SubPartitionConfig defines configuration for sub-partitioning
+type SubPartitionConfig struct {
+	Strategy    PartitionStrategy
+	Columns     []string
+	Modulus     int                  // For HASH partitioning
+	Values      []string             // For LIST partitioning
+	Granularity PartitionGranularity // For RANGE partitioning
+}
+
+// MultiLevelPartitionConfig supports multi-level partition configuration
+type MultiLevelPartitionConfig struct {
+	// Root level configuration
+	RootStrategy PartitionStrategy
+	RootColumns  []string
+
+	// Sub-partition configurations (optional)
+	// Index corresponds to partition level (0 = first sub-partition level, etc.)
+	SubPartitions []SubPartitionConfig
+}
+
 // PartitionConfig defines the configuration for creating a partitioned table
 type PartitionConfig struct {
 	// Strategy is the partitioning strategy (RANGE, LIST, or HASH)

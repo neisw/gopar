@@ -146,6 +146,101 @@ For example:
 - `events_2024_01_02`
 - etc.
 
+### Nested (Multi-level) Partitioning
+
+gopar supports nested partitioning where partitions are themselves partitioned. Common patterns:
+
+**LIST → RANGE (Release/Daily Pattern)**
+
+Partition by release version, then by date within each release:
+
+```go
+// Create nested partitions: LIST by release → RANGE by date
+releases := []string{"v1.0", "v2.0", "v3.0"}
+startDate := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+endDate := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)
+
+count, err := db.CreateMissingPartitionsListToRange(
+    "events",
+    releases,
+    startDate,
+    endDate,
+    "event_date",
+    false,
+)
+// Creates: 3 intermediate partitions + 1,095 daily leaf partitions
+// Structure:
+// events (LIST by release_name)
+// ├── events_v1_0 (RANGE by event_date)
+// │   ├── events_v1_0_2024_01_01
+// │   ├── events_v1_0_2024_01_02
+// │   └── ... (365 partitions)
+// ├── events_v2_0 (RANGE by event_date)
+// │   └── ... (365 partitions)
+// └── events_v3_0 (RANGE by event_date)
+//     └── ... (365 partitions)
+```
+
+**Querying Nested Partitions**
+
+```go
+// Get full partition hierarchy
+hierarchy, err := db.GetPartitionHierarchy("events")
+
+// Get only leaf partitions (those that hold data)
+leaves, err := db.ListLeafPartitions("events")
+
+// Get all daily partitions for a specific release
+v1Partitions, err := db.GetDailyPartitionsForRelease("events", "v1.0")
+```
+
+**Nested Partition Retention**
+
+```go
+// Option 1: Drop entire release (intermediate + all children)
+err := db.DetachPartition("events_v1_0", false)
+err = db.DropPartition("events_v1_0", false)
+
+// Option 2: Different retention per release
+retentionByRelease := map[string]int{
+    "v1.0": 30,  // Keep 30 days
+    "v2.0": 90,  // Keep 90 days
+    "v3.0": 0,   // Keep forever
+}
+
+for release, days := range retentionByRelease {
+    if days == 0 {
+        continue
+    }
+    
+    partitions, _ := db.GetDailyPartitionsForRelease("events", release)
+    cutoff := time.Now().AddDate(0, 0, -days)
+    
+    for _, p := range partitions {
+        if p.PartitionDate != nil && p.PartitionDate.Before(cutoff) {
+            db.DetachPartition(p.TableName, false)
+        }
+    }
+}
+```
+
+**Important Notes for Nested Partitioning:**
+
+1. **Primary Key Requirements**: Must include all partition keys
+   ```sql
+   -- For LIST → RANGE partitioning
+   PRIMARY KEY (id, release_name, event_date)
+   ```
+
+2. **Partition Pruning**: Queries benefit from multi-level pruning
+   ```sql
+   -- Single partition scan
+   WHERE release_name = 'v1.0' AND event_date = '2024-01-15'
+   -- Only scans: events_v1_0_2024_01_15
+   ```
+
+3. **Supported Combinations**: LIST→RANGE, RANGE→LIST, RANGE→RANGE, LIST→LIST, HASH combinations
+
 ### Dry-run Mode
 
 Most operations support a `dryRun` parameter. When set to `true`, the operation will:
@@ -171,6 +266,9 @@ gopar provides utilities to analyze and handle these cases during migrations.
 - `PartitionInfo`: Metadata about a partition
 - `PartitionStats`: Aggregate statistics about partitions
 - `RetentionSummary`: Summary of retention policy impact
+- `PartitionHierarchyInfo`: Metadata about a partition in a nested hierarchy
+- `PartitionLevel`: Depth in partition hierarchy (0=root, 1=first level, etc.)
+- `MultiLevelPartitionConfig`: Configuration for multi-level partitioning
 
 ### Key Methods
 
@@ -183,6 +281,14 @@ gopar provides utilities to analyze and handle these cases during migrations.
 - `AttachPartition()`: Attach a detached partition
 - `DetachPartition()`: Detach a partition (safer than dropping)
 - `DropPartition()`: Drop a partition permanently
+
+#### Nested Partition Management
+- `CreateMissingPartitionsListToRange()`: Create LIST→RANGE nested partitions
+- `GetPartitionHierarchy()`: Get complete partition hierarchy with all levels
+- `ListLeafPartitions()`: Get only leaf partitions (those holding data)
+- `GetPartitionLevel()`: Get the nesting level of a specific partition
+- `GetDailyPartitionsForRelease()`: Get daily partitions for a specific release
+- `IsPartitionAttached()`: Check if partition is attached to parent
 
 #### Migration
 - `MigrateToPartitionedTable()`: Initial migration to partitioned table (table must exist)
