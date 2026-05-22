@@ -9,7 +9,58 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// MigrateToPartitionedTable migrates data from a non-partitioned table to an existing
+// MigrationConfig holds configuration for table migration operations
+type MigrationConfig struct {
+	// SourceTable is the name of the existing non-partitioned table to migrate from
+	SourceTable string
+
+	// TargetTable is the name of the partitioned table to migrate to
+	// If empty, defaults to SourceTable + "_partitioned"
+	TargetTable string
+
+	// RangePartitionColumn is the column used for RANGE partitioning and date-range migration
+	// Common values: "created_at", "timestamp", "date"
+	RangePartitionColumn string
+
+	// UsePartmanFormat specifies whether to use pg_partman naming format (tablename_pYYYY_MM_DD)
+	// Default is false (uses tablename_YYYY_MM_DD)
+	UsePartmanFormat bool
+
+	// MigrateUpTo specifies the date boundary for migration (exclusive)
+	// Data with RangePartitionColumn < MigrateUpTo will be migrated
+	MigrateUpTo time.Time
+
+	// MoveForeignKeys determines whether to move foreign keys to the new table (true)
+	// or drop them (false). Only used in FinalizePartitionedTableMigration
+	MoveForeignKeys bool
+
+	// DryRun when true, logs all steps without executing them
+	DryRun bool
+}
+
+// Validate checks if the migration configuration is valid
+func (cfg *MigrationConfig) Validate() error {
+	if cfg.SourceTable == "" {
+		return fmt.Errorf("SourceTable must be specified")
+	}
+	if cfg.RangePartitionColumn == "" {
+		return fmt.Errorf("RangePartitionColumn must be specified")
+	}
+	if cfg.MigrateUpTo.IsZero() {
+		return fmt.Errorf("MigrateUpTo must be specified")
+	}
+	return nil
+}
+
+// GetTargetTable returns the target table name, using the default if not specified
+func (cfg *MigrationConfig) GetTargetTable() string {
+	if cfg.TargetTable != "" {
+		return cfg.TargetTable
+	}
+	return cfg.SourceTable + "_partitioned"
+}
+
+// MigrateToPartitionedTableWithConfig migrates data from a non-partitioned table to an existing
 // partitioned table, creating daily partitions covering the source table's date range.
 // Keeping the migrateUpTo date behind the current date allows follow-up Update and
 // Finalize migration to fill in data incrementally picking up from the previous migrateUpTo date.
@@ -17,28 +68,25 @@ import (
 // IMPORTANT: The target partitioned table must already exist before calling this function.
 // Use standard DDL or GORM AutoMigrate to create the partitioned table structure first.
 //
-// Parameters:
-//   - sourceTable: name of the existing non-partitioned table to migrate from
-//   - dateColumn: the column used for partitioning and date-range migration
-//   - migrateUpTo: migrate data with dateColumn < migrateUpTo
-//   - dryRun: if true, logs all steps without executing
-//
-// The target table name is derived as sourceTable + "_partitioned".
-//
 // Steps performed:
 //  1. Verify the target partitioned table exists
 //  2. Create daily partitions from the earliest data date through migrateUpTo + 7 days
-//  3. Migrate data from sourceTable where dateColumn >= earliest and dateColumn < migrateUpTo
+//  3. Migrate data from sourceTable where RangePartitionColumn >= earliest and RangePartitionColumn < migrateUpTo
 //  4. Sync identity columns so new inserts get correct IDs
-func (dbc *DB) MigrateToPartitionedTable(sourceTable, dateColumn string, migrateUpTo time.Time, dryRun bool) error {
-	targetTable := sourceTable + "_partitioned"
+func (dbc *DB) MigrateToPartitionedTableWithConfig(cfg MigrationConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid migration config: %w", err)
+	}
+
+	targetTable := cfg.GetTargetTable()
 
 	l := log.WithFields(log.Fields{
-		"source":        sourceTable,
-		"target":        targetTable,
-		"date_column":   dateColumn,
-		"migrate_up_to": migrateUpTo.Format("2006-01-02"),
-		"dry_run":       dryRun,
+		"source":                 cfg.SourceTable,
+		"target":                 targetTable,
+		"range_partition_column": cfg.RangePartitionColumn,
+		"migrate_up_to":          cfg.MigrateUpTo.Format("2006-01-02"),
+		"use_partman_format":     cfg.UsePartmanFormat,
+		"dry_run":                cfg.DryRun,
 	})
 
 	l.Info("starting migration to partitioned table")
@@ -57,18 +105,18 @@ func (dbc *DB) MigrateToPartitionedTable(sourceTable, dateColumn string, migrate
 	// Step 2: Determine date range and create partitions
 	l.Info("step 2: determining date range for partitions")
 	var minDate time.Time
-	query := fmt.Sprintf("SELECT MIN(%s) FROM %s", pq.QuoteIdentifier(dateColumn), pq.QuoteIdentifier(sourceTable))
+	query := fmt.Sprintf("SELECT MIN(%s) FROM %s", pq.QuoteIdentifier(cfg.RangePartitionColumn), pq.QuoteIdentifier(cfg.SourceTable))
 	result := dbc.DB.Raw(query).Scan(&minDate)
 	if result.Error != nil {
-		return fmt.Errorf("failed to get min %s from %s: %w", dateColumn, sourceTable, result.Error)
+		return fmt.Errorf("failed to get min %s from %s: %w", cfg.RangePartitionColumn, cfg.SourceTable, result.Error)
 	}
 
 	if minDate.IsZero() {
-		return fmt.Errorf("source table %s is empty or %s has no values", sourceTable, dateColumn)
+		return fmt.Errorf("source table %s is empty or %s has no values", cfg.SourceTable, cfg.RangePartitionColumn)
 	}
 
 	// Create partitions from earliest data through migrateUpTo + 7 days buffer
-	partitionEnd := migrateUpTo.AddDate(0, 0, 7)
+	partitionEnd := cfg.MigrateUpTo.AddDate(0, 0, 7)
 	partitionStart := minDate.UTC().Truncate(24 * time.Hour)
 
 	l.WithFields(log.Fields{
@@ -76,17 +124,17 @@ func (dbc *DB) MigrateToPartitionedTable(sourceTable, dateColumn string, migrate
 		"partition_end":   partitionEnd.Format("2006-01-02"),
 	}).Info("creating partitions")
 
-	created, err := dbc.CreateMissingPartitions(targetTable, partitionStart.AddDate(0, 0, -1), partitionEnd, dryRun)
+	created, err := dbc.CreateMissingPartitions(targetTable, partitionStart.AddDate(0, 0, -1), partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to create partitions: %w", err)
 	}
 	l.WithField("partitions_created", created).Info("partitions created")
 
 	// can't go any further if we haven't created the table
-	if !dryRun {
+	if !cfg.DryRun {
 		// Step 3: Migrate data
 		l.Info("step 3: migrating data")
-		rows, err := dbc.MigrateTableDataRange(sourceTable, targetTable, dateColumn, partitionStart, migrateUpTo, nil, dryRun)
+		rows, err := dbc.MigrateTableDataRange(cfg.SourceTable, targetTable, cfg.RangePartitionColumn, partitionStart, cfg.MigrateUpTo, nil, cfg.DryRun)
 		if err != nil {
 			return fmt.Errorf("failed to migrate data: %w", err)
 		}
@@ -104,30 +152,49 @@ func (dbc *DB) MigrateToPartitionedTable(sourceTable, dateColumn string, migrate
 	return nil
 }
 
-// UpdatePartitionedTableMigration migrates additional data from the source table to
-// the partitioned table created by MigrateToPartitionedTable. Call this one or more
-// times to incrementally catch up before calling FinalizePartitionedTableMigration.
+// MigrateToPartitionedTable migrates data from a non-partitioned table to an existing
+// partitioned table, creating daily partitions covering the source table's date range.
+//
+// Deprecated: Use MigrateToPartitionedTableWithConfig instead for more configuration options.
 //
 // Parameters:
-//   - sourceTable: name of the original non-partitioned table
+//   - sourceTable: name of the existing non-partitioned table to migrate from
 //   - dateColumn: the column used for partitioning and date-range migration
 //   - migrateUpTo: migrate data with dateColumn < migrateUpTo
 //   - dryRun: if true, logs all steps without executing
+func (dbc *DB) MigrateToPartitionedTable(sourceTable, dateColumn string, migrateUpTo time.Time, dryRun bool) error {
+	return dbc.MigrateToPartitionedTableWithConfig(MigrationConfig{
+		SourceTable:          sourceTable,
+		RangePartitionColumn: dateColumn,
+		MigrateUpTo:          migrateUpTo,
+		UsePartmanFormat:     false,
+		DryRun:               dryRun,
+	})
+}
+
+// UpdatePartitionedTableMigrationWithConfig migrates additional data from the source table to
+// the partitioned table created by MigrateToPartitionedTableWithConfig. Call this one or more
+// times to incrementally catch up before calling FinalizePartitionedTableMigrationWithConfig.
 //
 // Steps performed:
 //  1. Find the newest date already migrated in the partitioned table
 //  2. Verify partitions exist for the range; create any that are missing
-//  3. Migrate data from sourceTable where dateColumn > newest migrated and dateColumn < migrateUpTo
+//  3. Migrate data from sourceTable where RangePartitionColumn > newest migrated and RangePartitionColumn < migrateUpTo
 //  4. Sync identity column so new inserts get correct IDs
-func (dbc *DB) UpdatePartitionedTableMigration(sourceTable, dateColumn string, migrateUpTo time.Time, dryRun bool) error {
-	targetTable := sourceTable + "_partitioned"
+func (dbc *DB) UpdatePartitionedTableMigrationWithConfig(cfg MigrationConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid migration config: %w", err)
+	}
+
+	targetTable := cfg.GetTargetTable()
 
 	l := log.WithFields(log.Fields{
-		"source":        sourceTable,
-		"target":        targetTable,
-		"date_column":   dateColumn,
-		"migrate_up_to": migrateUpTo.Format("2006-01-02"),
-		"dry_run":       dryRun,
+		"source":                 cfg.SourceTable,
+		"target":                 targetTable,
+		"range_partition_column": cfg.RangePartitionColumn,
+		"migrate_up_to":          cfg.MigrateUpTo.Format("2006-01-02"),
+		"use_partman_format":     cfg.UsePartmanFormat,
+		"dry_run":                cfg.DryRun,
 	})
 
 	l.Info("starting incremental migration update")
@@ -135,35 +202,35 @@ func (dbc *DB) UpdatePartitionedTableMigration(sourceTable, dateColumn string, m
 	// Step 1: Find the newest date already migrated
 	l.Info("step 1: finding newest migrated date")
 	var maxDate time.Time
-	query := fmt.Sprintf("SELECT COALESCE(MAX(%s), '0001-01-01'::timestamp) FROM %s", pq.QuoteIdentifier(dateColumn), pq.QuoteIdentifier(targetTable))
+	query := fmt.Sprintf("SELECT COALESCE(MAX(%s), '0001-01-01'::timestamp) FROM %s", pq.QuoteIdentifier(cfg.RangePartitionColumn), pq.QuoteIdentifier(targetTable))
 	result := dbc.DB.Raw(query).Scan(&maxDate)
 	if result.Error != nil {
-		return fmt.Errorf("failed to get max %s from %s: %w", dateColumn, targetTable, result.Error)
+		return fmt.Errorf("failed to get max %s from %s: %w", cfg.RangePartitionColumn, targetTable, result.Error)
 	}
 
 	if maxDate.IsZero() || maxDate.Year() == 1 {
-		return fmt.Errorf("partitioned table %s has no data; run MigrateToPartitionedTable first", targetTable)
+		return fmt.Errorf("partitioned table %s has no data; run MigrateToPartitionedTableWithConfig first", targetTable)
 	}
 
-	if !migrateUpTo.After(maxDate) {
+	if !cfg.MigrateUpTo.After(maxDate) {
 		l.WithFields(log.Fields{
 			"newest_migrated": maxDate.Format("2006-01-02 15:04:05"),
-			"migrate_up_to":   migrateUpTo.Format("2006-01-02"),
+			"migrate_up_to":   cfg.MigrateUpTo.Format("2006-01-02"),
 		}).Info("no new data to migrate; migrateUpTo is not after newest migrated date")
 		return nil
 	}
 
 	l.WithFields(log.Fields{
 		"migrate_from":  maxDate.Format("2006-01-02 15:04:05"),
-		"migrate_up_to": migrateUpTo.Format("2006-01-02"),
+		"migrate_up_to": cfg.MigrateUpTo.Format("2006-01-02"),
 	}).Info("determined migration range")
 
 	// Step 2: Verify and create missing partitions
 	l.Info("step 2: verifying partitions")
 	partitionStart := maxDate.UTC().Truncate(24 * time.Hour)
-	partitionEnd := migrateUpTo.AddDate(0, 0, 7)
+	partitionEnd := cfg.MigrateUpTo.AddDate(0, 0, 7)
 
-	created, err := dbc.CreateMissingPartitions(targetTable, partitionStart, partitionEnd, dryRun)
+	created, err := dbc.CreateMissingPartitions(targetTable, partitionStart, partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to create missing partitions: %w", err)
 	}
@@ -172,14 +239,14 @@ func (dbc *DB) UpdatePartitionedTableMigration(sourceTable, dateColumn string, m
 	// Step 3: Migrate data from the day after the newest migrated date through migrateUpTo
 	l.Info("step 3: migrating new data")
 	migrateFrom := maxDate.Add(time.Microsecond)
-	rows, err := dbc.MigrateTableDataRange(sourceTable, targetTable, dateColumn, migrateFrom, migrateUpTo, nil, dryRun)
+	rows, err := dbc.MigrateTableDataRange(cfg.SourceTable, targetTable, cfg.RangePartitionColumn, migrateFrom, cfg.MigrateUpTo, nil, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to migrate data: %w", err)
 	}
 	l.WithField("rows_migrated", rows).Info("data migration complete")
 
 	// Step 4: Sync identity column
-	if !dryRun {
+	if !cfg.DryRun {
 		l.Info("step 4: syncing identity column")
 		if err := dbc.SyncIdentityColumn(targetTable, "id"); err != nil {
 			return fmt.Errorf("failed to sync identity column: %w", err)
@@ -191,39 +258,55 @@ func (dbc *DB) UpdatePartitionedTableMigration(sourceTable, dateColumn string, m
 	return nil
 }
 
-// FinalizePartitionedTableMigration migrates any remaining data from the source table
-// to the partitioned table, syncs identity columns, swaps the tables so the partitioned
-// table takes the original name, and handles foreign keys.
+// UpdatePartitionedTableMigration migrates additional data from the source table to
+// the partitioned table created by MigrateToPartitionedTable.
+//
+// Deprecated: Use UpdatePartitionedTableMigrationWithConfig instead for more configuration options.
 //
 // Parameters:
 //   - sourceTable: name of the original non-partitioned table
 //   - dateColumn: the column used for partitioning and date-range migration
 //   - migrateUpTo: migrate data with dateColumn < migrateUpTo
-//   - moveForeignKeys: if true, foreign keys are moved from the old table to the new
-//     partitioned table; if false, foreign keys are dropped (necessary when the
-//     partitioned table cannot support the FK constraints)
 //   - dryRun: if true, logs all steps without executing
+func (dbc *DB) UpdatePartitionedTableMigration(sourceTable, dateColumn string, migrateUpTo time.Time, dryRun bool) error {
+	return dbc.UpdatePartitionedTableMigrationWithConfig(MigrationConfig{
+		SourceTable:          sourceTable,
+		RangePartitionColumn: dateColumn,
+		MigrateUpTo:          migrateUpTo,
+		UsePartmanFormat:     false,
+		DryRun:               dryRun,
+	})
+}
+
+// FinalizePartitionedTableMigrationWithConfig migrates any remaining data from the source table
+// to the partitioned table, syncs identity columns, swaps the tables so the partitioned
+// table takes the original name, and handles foreign keys.
 //
-// Assumes MigrateToPartitionedTable was previously called to create sourceTable + "_partitioned".
+// Assumes MigrateToPartitionedTableWithConfig was previously called to create the partitioned table.
 //
 // Steps performed:
 //  1. Determine the newest date already migrated in the partitioned table
 //  2. Create any missing partitions up to migrateUpTo + 7 days
-//  3. Migrate remaining data from sourceTable where dateColumn >= newest migrated and dateColumn < migrateUpTo
+//  3. Migrate remaining data from sourceTable where RangePartitionColumn >= newest migrated and RangePartitionColumn < migrateUpTo
 //  4. Sync identity columns
-//  5. Swap tables: sourceTable → sourceTable_old, sourceTable_partitioned → sourceTable
-//  6. Move or drop foreign keys from sourceTable_old
-func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string, migrateUpTo time.Time, moveForeignKeys, dryRun bool) error {
-	partitionedTable := sourceTable + "_partitioned"
-	oldTable := sourceTable + "_old"
+//  5. Swap tables: sourceTable → sourceTable_old, targetTable → sourceTable
+//  6. Move or drop foreign keys from sourceTable_old based on config.MoveForeignKeys
+func (dbc *DB) FinalizePartitionedTableMigrationWithConfig(cfg MigrationConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid migration config: %w", err)
+	}
+
+	partitionedTable := cfg.GetTargetTable()
+	oldTable := cfg.SourceTable + "_old"
 
 	l := log.WithFields(log.Fields{
-		"source":            sourceTable,
-		"partitioned_table": partitionedTable,
-		"date_column":       dateColumn,
-		"migrate_up_to":     migrateUpTo.Format("2006-01-02"),
-		"move_foreign_keys": moveForeignKeys,
-		"dry_run":           dryRun,
+		"source":                 cfg.SourceTable,
+		"partitioned_table":      partitionedTable,
+		"range_partition_column": cfg.RangePartitionColumn,
+		"migrate_up_to":          cfg.MigrateUpTo.Format("2006-01-02"),
+		"use_partman_format":     cfg.UsePartmanFormat,
+		"move_foreign_keys":      cfg.MoveForeignKeys,
+		"dry_run":                cfg.DryRun,
 	})
 
 	l.Info("starting finalization of partitioned table migration")
@@ -231,28 +314,28 @@ func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string,
 	// Step 1: Find the newest date already migrated
 	l.Info("step 1: checking for new data to migrate")
 	var maxDate time.Time
-	query := fmt.Sprintf("SELECT COALESCE(MAX(%s), '0001-01-01'::timestamp) FROM %s", pq.QuoteIdentifier(dateColumn), pq.QuoteIdentifier(partitionedTable))
+	query := fmt.Sprintf("SELECT COALESCE(MAX(%s), '0001-01-01'::timestamp) FROM %s", pq.QuoteIdentifier(cfg.RangePartitionColumn), pq.QuoteIdentifier(partitionedTable))
 	result := dbc.DB.Raw(query).Scan(&maxDate)
 	if result.Error != nil {
-		return fmt.Errorf("failed to get max %s from %s: %w", dateColumn, partitionedTable, result.Error)
+		return fmt.Errorf("failed to get max %s from %s: %w", cfg.RangePartitionColumn, partitionedTable, result.Error)
 	}
 
 	migrateFrom := maxDate
 	if maxDate.IsZero() || maxDate.Year() == 1 {
-		return fmt.Errorf("partitioned table %s has no data; run MigrateToPartitionedTable first", partitionedTable)
+		return fmt.Errorf("partitioned table %s has no data; run MigrateToPartitionedTableWithConfig first", partitionedTable)
 	}
 
 	l.WithFields(log.Fields{
 		"newest_migrated": migrateFrom.Format("2006-01-02 15:04:05"),
-		"migrate_up_to":   migrateUpTo.Format("2006-01-02"),
+		"migrate_up_to":   cfg.MigrateUpTo.Format("2006-01-02"),
 	}).Info("determined migration range")
 
 	// Step 2: Create any missing partitions
 	l.Info("step 2: creating missing partitions")
-	partitionEnd := migrateUpTo.AddDate(0, 0, 7)
+	partitionEnd := cfg.MigrateUpTo.AddDate(0, 0, 7)
 	partitionStart := migrateFrom.UTC().Truncate(24 * time.Hour)
 
-	created, err := dbc.CreateMissingPartitions(partitionedTable, partitionStart, partitionEnd, dryRun)
+	created, err := dbc.CreateMissingPartitions(partitionedTable, partitionStart, partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to create partitions: %w", err)
 	}
@@ -261,7 +344,7 @@ func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string,
 	// Step 3: Migrate remaining data from the day after the newest migrated date
 	l.Info("step 3: migrating remaining data")
 	migrateFromNext := migrateFrom.Add(time.Microsecond)
-	rows, err := dbc.MigrateTableDataRange(sourceTable, partitionedTable, dateColumn, migrateFromNext, migrateUpTo, nil, dryRun)
+	rows, err := dbc.MigrateTableDataRange(cfg.SourceTable, partitionedTable, cfg.RangePartitionColumn, migrateFromNext, cfg.MigrateUpTo, nil, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to migrate remaining data: %w", err)
 	}
@@ -269,7 +352,7 @@ func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string,
 
 	// Step 4: Sync identity column
 	l.Info("step 4: syncing identity column")
-	if !dryRun {
+	if !cfg.DryRun {
 		if err := dbc.SyncIdentityColumn(partitionedTable, "id"); err != nil {
 			return fmt.Errorf("failed to sync identity column: %w", err)
 		}
@@ -279,31 +362,31 @@ func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string,
 	// Step 5: Swap tables atomically
 	l.Info("step 5: swapping tables")
 	renames := []TableRename{
-		{From: sourceTable, To: oldTable},
-		{From: partitionedTable, To: sourceTable},
+		{From: cfg.SourceTable, To: oldTable},
+		{From: partitionedTable, To: cfg.SourceTable},
 	}
 
-	count, err := dbc.RenameTables(renames, true, true, true, true, dryRun)
+	count, err := dbc.RenameTables(renames, true, true, true, true, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to swap tables: %w", err)
 	}
 	l.WithField("renames", count).Info("tables swapped")
 
 	// Step 6: Move or drop foreign keys
-	fkTarget := sourceTable
-	if !moveForeignKeys {
+	fkTarget := cfg.SourceTable
+	if !cfg.MoveForeignKeys {
 		fkTarget = ""
 	}
-	if moveForeignKeys {
+	if cfg.MoveForeignKeys {
 		l.Info("step 6: moving foreign keys")
 	} else {
 		l.Info("step 6: dropping foreign keys")
 	}
-	moved, err := dbc.MoveForeignKeys(oldTable, fkTarget, dryRun)
+	moved, err := dbc.MoveForeignKeys(oldTable, fkTarget, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to process foreign keys: %w", err)
 	}
-	if moveForeignKeys {
+	if cfg.MoveForeignKeys {
 		l.WithField("fks_moved", moved).Info("foreign keys moved")
 	} else {
 		l.WithField("fks_dropped", moved).Info("foreign keys dropped")
@@ -311,6 +394,30 @@ func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string,
 
 	l.Info("partitioned table migration finalized successfully")
 	return nil
+}
+
+// FinalizePartitionedTableMigration migrates any remaining data from the source table
+// to the partitioned table, syncs identity columns, swaps the tables so the partitioned
+// table takes the original name, and handles foreign keys.
+//
+// Deprecated: Use FinalizePartitionedTableMigrationWithConfig instead for more configuration options.
+//
+// Parameters:
+//   - sourceTable: name of the original non-partitioned table
+//   - dateColumn: the column used for partitioning and date-range migration
+//   - migrateUpTo: migrate data with dateColumn < migrateUpTo
+//   - moveForeignKeys: if true, foreign keys are moved from the old table to the new
+//     partitioned table; if false, foreign keys are dropped
+//   - dryRun: if true, logs all steps without executing
+func (dbc *DB) FinalizePartitionedTableMigration(sourceTable, dateColumn string, migrateUpTo time.Time, moveForeignKeys, dryRun bool) error {
+	return dbc.FinalizePartitionedTableMigrationWithConfig(MigrationConfig{
+		SourceTable:          sourceTable,
+		RangePartitionColumn: dateColumn,
+		MigrateUpTo:          migrateUpTo,
+		UsePartmanFormat:     false,
+		MoveForeignKeys:      moveForeignKeys,
+		DryRun:               dryRun,
+	})
 }
 
 // AnalyzePartitioningImpact examines the foreign key relationships for a table and

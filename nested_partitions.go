@@ -275,9 +275,10 @@ func (dbc *DB) GetPartitionLevel(partitionName string) (int, error) {
 }
 
 // extractDateFromPartitionName extracts date from partition name
-// Supports formats: tablename_YYYY_MM_DD or tablename_suffix_YYYY_MM_DD
+// Supports formats: tablename_YYYY_MM_DD, tablename_suffix_YYYY_MM_DD,
+// tablename_pYYYY_MM_DD (pg_partman), tablename_suffix_pYYYY_MM_DD
 func extractDateFromPartitionName(partitionName string) *time.Time {
-	// Find last occurrence of pattern _YYYY_MM_DD
+	// Find last occurrence of pattern _YYYY_MM_DD or _pYYYY_MM_DD
 	parts := strings.Split(partitionName, "_")
 	if len(parts) < 3 {
 		return nil
@@ -285,6 +286,13 @@ func extractDateFromPartitionName(partitionName string) *time.Time {
 
 	// Take last 3 parts as potential date
 	dateStr := strings.Join(parts[len(parts)-3:], "_")
+
+	// Check for pg_partman format (pYYYY_MM_DD)
+	if len(dateStr) > 1 && dateStr[0] == 'p' && dateStr[1] >= '0' && dateStr[1] <= '9' {
+		// Strip the 'p' prefix
+		dateStr = dateStr[1:]
+	}
+
 	t, err := time.Parse("2006_01_02", dateStr)
 	if err != nil {
 		return nil
@@ -315,6 +323,7 @@ func (dbc *DB) CreateMissingPartitionsListToRange(
 	releases []string, // List of release names (e.g., ["v1.0", "v2.0", "v3.0"])
 	startDate, endDate time.Time,
 	dateColumn string,
+	usePartmanFormat bool,
 	dryRun bool,
 ) (int, error) {
 	createdCount := 0
@@ -369,6 +378,7 @@ func (dbc *DB) CreateMissingPartitionsListToRange(
 				intermediatePartition,
 				startDate,
 				endDate,
+				usePartmanFormat,
 				dryRun,
 			)
 			if err != nil {
@@ -424,6 +434,7 @@ func (dbc *DB) createListMemberWithRangeSubPartitions(
 func (dbc *DB) createDailyPartitionsUnder(
 	intermediatePartition string,
 	startDate, endDate time.Time,
+	usePartmanFormat bool,
 	dryRun bool,
 ) (int, error) {
 	createdCount := 0
@@ -435,10 +446,13 @@ func (dbc *DB) createDailyPartitionsUnder(
 	for !currentDate.After(endDateNormalized) {
 		nextDate := currentDate.AddDate(0, 0, 1)
 
-		// Partition name: events_v1_0_2024_01_01
-		dailyPartition := fmt.Sprintf("%s_%s",
-			intermediatePartition,
-			currentDate.Format("2006_01_02"))
+		// Partition name: events_v1_0_2024_01_01 or events_v1_0_p2024_01_01
+		var dailyPartition string
+		if usePartmanFormat {
+			dailyPartition = fmt.Sprintf("%s_p%s", intermediatePartition, currentDate.Format("2006_01_02"))
+		} else {
+			dailyPartition = fmt.Sprintf("%s_%s", intermediatePartition, currentDate.Format("2006_01_02"))
+		}
 
 		// Check if daily partition already exists
 		exists, err := dbc.partitionExists(dailyPartition)

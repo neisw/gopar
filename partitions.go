@@ -248,12 +248,23 @@ func (dbc *DB) ListTablePartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
 	var partitions []PartitionInfo
 
-	query := `
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build SQL pattern based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
+
+	query := fmt.Sprintf(`
 		SELECT
 			tablename,
 			'public' as schemaname,
-			TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
-			(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD'))::INT AS age_days,
+			TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
+			(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD'))::INT AS age_days,
 			pg_total_relation_size('public.'||tablename) AS size_bytes,
 			pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS size_pretty,
 			COALESCE(n_live_tup, 0) AS row_estimate
@@ -263,9 +274,8 @@ func (dbc *DB) ListTablePartitions(tableName string) ([]PartitionInfo, error) {
 		WHERE pg_tables.schemaname = 'public'
 			AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
 		ORDER BY partition_date ASC
-	`
+	`, sqlPattern, sqlPattern)
 
-	tablePattern := escapeForLike(tableName) + `\_20%`
 	result := dbc.DB.Raw(query, sql.Named("table_pattern", tablePattern)).Scan(&partitions)
 	if result.Error != nil {
 		log.WithError(result.Error).WithField("table", tableName).Error("failed to list table partitions")
@@ -287,11 +297,22 @@ func (dbc *DB) GetPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
 	var stats PartitionStats
 
-	query := `
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build patterns based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
+
+	query := fmt.Sprintf(`
 		WITH partition_info AS (
 			SELECT
 				tablename,
-				TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
+				TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
 				pg_total_relation_size('public.'||tablename) AS size_bytes
 			FROM pg_tables
 			WHERE schemaname = 'public'
@@ -306,9 +327,8 @@ func (dbc *DB) GetPartitionStats(tableName string) (*PartitionStats, error) {
 			AVG(size_bytes)::BIGINT AS avg_size_bytes,
 			pg_size_pretty(AVG(size_bytes)::BIGINT) AS avg_size_pretty
 		FROM partition_info
-	`
+	`, sqlPattern)
 
-	tablePattern := escapeForLike(tableName) + `\_20%`
 	result := dbc.DB.Raw(query, sql.Named("table_pattern", tablePattern)).Scan(&stats)
 	if result.Error != nil {
 		log.WithError(result.Error).WithField("table", tableName).Error("failed to get partition statistics")
@@ -336,10 +356,21 @@ func (dbc *DB) GetPartitionsForRemoval(tableName string, retentionDays int, atta
 
 	cutoffDate := time.Now().AddDate(0, 0, -retentionDays)
 
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build patterns based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
+
 	var query string
 	if attachedOnly {
 		// Only return attached partitions
-		query = `
+		query = fmt.Sprintf(`
 			WITH attached_partitions AS (
 				SELECT c.relname AS tablename
 				FROM pg_inherits i
@@ -350,8 +381,8 @@ func (dbc *DB) GetPartitionsForRemoval(tableName string, retentionDays int, atta
 			SELECT
 				tablename,
 				'public' as schemaname,
-				TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
-				(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD'))::INT AS age_days,
+				TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
+				(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD'))::INT AS age_days,
 				pg_total_relation_size('public.'||tablename) AS size_bytes,
 				pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS size_pretty,
 				COALESCE(n_live_tup, 0) AS row_estimate
@@ -361,17 +392,17 @@ func (dbc *DB) GetPartitionsForRemoval(tableName string, retentionDays int, atta
 			WHERE pg_tables.schemaname = 'public'
 				AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
 				AND pg_tables.tablename IN (SELECT tablename FROM attached_partitions)
-				AND TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') < @cutoff_date
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
 			ORDER BY partition_date ASC
-		`
+		`, sqlPattern, sqlPattern, sqlPattern)
 	} else {
 		// Return all partitions (attached + detached)
-		query = `
+		query = fmt.Sprintf(`
 			SELECT
 				tablename,
 				'public' as schemaname,
-				TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
-				(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD'))::INT AS age_days,
+				TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
+				(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD'))::INT AS age_days,
 				pg_total_relation_size('public.'||tablename) AS size_bytes,
 				pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS size_pretty,
 				COALESCE(n_live_tup, 0) AS row_estimate
@@ -380,12 +411,10 @@ func (dbc *DB) GetPartitionsForRemoval(tableName string, retentionDays int, atta
 				AND pg_stat_user_tables.schemaname = pg_tables.schemaname
 			WHERE pg_tables.schemaname = 'public'
 				AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
-				AND TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') < @cutoff_date
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
 			ORDER BY partition_date ASC
-		`
+		`, sqlPattern, sqlPattern, sqlPattern)
 	}
-
-	tablePattern := escapeForLike(tableName) + `\_20%`
 	result := dbc.DB.Raw(query,
 		sql.Named("table_name", tableName),
 		sql.Named("table_pattern", tablePattern),
@@ -420,10 +449,21 @@ func (dbc *DB) GetRetentionSummary(tableName string, retentionDays int, attached
 	summary.RetentionDays = retentionDays
 	summary.CutoffDate = cutoffDate
 
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build patterns based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
+
 	var query string
 	if attachedOnly {
 		// Only consider attached partitions
-		query = `
+		query = fmt.Sprintf(`
 			WITH attached_partitions AS (
 				SELECT c.relname AS tablename
 				FROM pg_inherits i
@@ -441,11 +481,11 @@ func (dbc *DB) GetRetentionSummary(tableName string, retentionDays int, attached
 			WHERE schemaname = 'public'
 				AND tablename LIKE @table_pattern ESCAPE '\'
 				AND tablename IN (SELECT tablename FROM attached_partitions)
-				AND TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') < @cutoff_date
-		`
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
+		`, sqlPattern)
 	} else {
 		// Consider all partitions (attached + detached)
-		query = `
+		query = fmt.Sprintf(`
 			SELECT
 				COUNT(*)::INT AS partitions_to_remove,
 				COALESCE(SUM(pg_total_relation_size('public.'||tablename)), 0)::BIGINT AS storage_to_reclaim,
@@ -455,11 +495,9 @@ func (dbc *DB) GetRetentionSummary(tableName string, retentionDays int, attached
 			FROM pg_tables
 			WHERE schemaname = 'public'
 				AND tablename LIKE @table_pattern ESCAPE '\'
-				AND TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') < @cutoff_date
-		`
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
+		`, sqlPattern)
 	}
-
-	tablePattern := escapeForLike(tableName) + `\_20%`
 	result := dbc.DB.Raw(query,
 		sql.Named("table_name", tableName),
 		sql.Named("table_pattern", tablePattern),
@@ -546,7 +584,7 @@ func (dbc *DB) DropPartition(partitionName string, dryRun bool) error {
 
 	// Validate partition name format for safety
 	if !isValidPartitionName(tableName, partitionName) {
-		return fmt.Errorf("invalid partition name: %s - must match %s_YYYY_MM_DD", partitionName, tableName)
+		return fmt.Errorf("invalid partition name: %s - must match %s_YYYY_MM_DD or %s_pYYYY_MM_DD", partitionName, tableName, tableName)
 	}
 
 	if dryRun {
@@ -590,7 +628,7 @@ func (dbc *DB) DetachPartition(partitionName string, dryRun bool) error {
 
 	// Validate partition name format for safety
 	if !isValidPartitionName(tableName, partitionName) {
-		return fmt.Errorf("invalid partition name: %s - must match %s_YYYY_MM_DD", partitionName, tableName)
+		return fmt.Errorf("invalid partition name: %s - must match %s_YYYY_MM_DD or %s_pYYYY_MM_DD", partitionName, tableName, tableName)
 	}
 
 	if dryRun {
@@ -704,7 +742,18 @@ func (dbc *DB) ListDetachedPartitions(tableName string) ([]PartitionInfo, error)
 	start := time.Now()
 	var partitions []PartitionInfo
 
-	query := `
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build patterns based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
+
+	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
 			-- Get all currently attached partitions using pg_inherits
 			SELECT c.relname AS tablename
@@ -716,8 +765,8 @@ func (dbc *DB) ListDetachedPartitions(tableName string) ([]PartitionInfo, error)
 		SELECT
 			tablename,
 			'public' as schemaname,
-			TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
-			(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD'))::INT AS age_days,
+			TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
+			(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD'))::INT AS age_days,
 			pg_total_relation_size('public.'||tablename) AS size_bytes,
 			pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS size_pretty,
 			COALESCE(n_live_tup, 0) AS row_estimate
@@ -728,9 +777,7 @@ func (dbc *DB) ListDetachedPartitions(tableName string) ([]PartitionInfo, error)
 			AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
 			AND pg_tables.tablename NOT IN (SELECT tablename FROM attached_partitions)
 		ORDER BY partition_date ASC
-	`
-
-	tablePattern := escapeForLike(tableName) + `\_20%`
+	`, sqlPattern, sqlPattern)
 	result := dbc.DB.Raw(query,
 		sql.Named("table_name", tableName),
 		sql.Named("table_pattern", tablePattern)).Scan(&partitions)
@@ -755,7 +802,17 @@ func (dbc *DB) ListAttachedPartitions(tableName string) ([]PartitionInfo, error)
 	start := time.Now()
 	var partitions []PartitionInfo
 
-	query := `
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build pattern based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+
+	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
 			-- Get all currently attached partitions using pg_inherits
 			SELECT c.relname AS tablename
@@ -767,8 +824,8 @@ func (dbc *DB) ListAttachedPartitions(tableName string) ([]PartitionInfo, error)
 		SELECT
 			tablename,
 			'public' as schemaname,
-			TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
-			(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD'))::INT AS age_days,
+			TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
+			(CURRENT_DATE - TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD'))::INT AS age_days,
 			pg_total_relation_size('public.'||tablename) AS size_bytes,
 			pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS size_pretty,
 			COALESCE(n_live_tup, 0) AS row_estimate
@@ -778,7 +835,7 @@ func (dbc *DB) ListAttachedPartitions(tableName string) ([]PartitionInfo, error)
 		WHERE pg_tables.schemaname = 'public'
 			AND pg_tables.tablename IN (SELECT tablename FROM attached_partitions)
 		ORDER BY partition_date ASC
-	`
+	`, sqlPattern, sqlPattern)
 
 	result := dbc.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&partitions)
 	if result.Error != nil {
@@ -801,7 +858,17 @@ func (dbc *DB) GetAttachedPartitionStats(tableName string) (*PartitionStats, err
 	start := time.Now()
 	var stats PartitionStats
 
-	query := `
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build pattern based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+
+	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
 			SELECT c.relname AS tablename
 			FROM pg_inherits i
@@ -812,7 +879,7 @@ func (dbc *DB) GetAttachedPartitionStats(tableName string) (*PartitionStats, err
 		attached_info AS (
 			SELECT
 				tablename,
-				TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
+				TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
 				pg_total_relation_size('public.'||tablename) AS size_bytes
 			FROM pg_tables
 			WHERE schemaname = 'public'
@@ -827,7 +894,7 @@ func (dbc *DB) GetAttachedPartitionStats(tableName string) (*PartitionStats, err
 			COALESCE(AVG(size_bytes), 0)::BIGINT AS avg_size_bytes,
 			pg_size_pretty(COALESCE(AVG(size_bytes), 0)::BIGINT) AS avg_size_pretty
 		FROM attached_info
-	`
+	`, sqlPattern)
 
 	result := dbc.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&stats)
 	if result.Error != nil {
@@ -847,7 +914,7 @@ func (dbc *DB) GetAttachedPartitionStats(tableName string) (*PartitionStats, err
 }
 
 // CreateMissingPartitions creates partitions for a date range if they don't already exist
-// Assumes daily partitions (one partition per day) based on the naming convention: tablename_YYYY_MM_DD
+// Supports both standard format (tablename_YYYY_MM_DD) and pg_partman format (tablename_pYYYY_MM_DD)
 // Each partition covers a 24-hour period from midnight to midnight
 //
 // Workflow:
@@ -860,10 +927,11 @@ func (dbc *DB) GetAttachedPartitionStats(tableName string) (*PartitionStats, err
 //   - tableName: Name of the partitioned parent table
 //   - startDate: Start of date range (inclusive)
 //   - endDate: End of date range (inclusive)
+//   - usePartmanFormat: If true, uses pg_partman naming format (tablename_pYYYY_MM_DD)
 //   - dryRun: If true, logs what would be created without executing
 //
 // Returns: Count of partitions created (or would be created in dry-run mode)
-func (dbc *DB) CreateMissingPartitions(tableName string, startDate, endDate time.Time, dryRun bool) (int, error) {
+func (dbc *DB) CreateMissingPartitions(tableName string, startDate, endDate time.Time, usePartmanFormat bool, dryRun bool) (int, error) {
 	start := time.Now()
 
 	// Validate date range
@@ -895,7 +963,7 @@ func (dbc *DB) CreateMissingPartitions(tableName string, startDate, endDate time
 			partitionsToCreate = append(partitionsToCreate, currentDate)
 		} else {
 			// Partition exists — verify it is attached
-			partitionName := fmt.Sprintf("%s_%s", tableName, dateStr)
+			partitionName := buildPartitionName(tableName, currentDate, usePartmanFormat)
 			attached, err := dbc.IsPartitionAttached(partitionName)
 			if err != nil {
 				return 0, fmt.Errorf("failed to check if partition %s is attached: %w", partitionName, err)
@@ -918,7 +986,7 @@ func (dbc *DB) CreateMissingPartitions(tableName string, startDate, endDate time
 
 	if dryRun {
 		for _, partitionDate := range partitionsToCreate {
-			partitionName := fmt.Sprintf("%s_%s", tableName, partitionDate.Format("2006_01_02"))
+			partitionName := buildPartitionName(tableName, partitionDate, usePartmanFormat)
 			log.WithFields(log.Fields{
 				"partition": partitionName,
 				"table":     tableName,
@@ -938,20 +1006,20 @@ func (dbc *DB) CreateMissingPartitions(tableName string, startDate, endDate time
 		txDBC := &DB{DB: tx}
 
 		for _, partitionName := range partitionsToReattach {
-			if err := txDBC.AttachPartition(tableName, partitionName, false); err != nil {
+			if err := txDBC.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
 				return fmt.Errorf("failed to reattach partition %s: %w", partitionName, err)
 			}
 		}
 
 		for _, partitionDate := range partitionsToCreate {
-			partitionName := fmt.Sprintf("%s_%s", tableName, partitionDate.Format("2006_01_02"))
+			partitionName := buildPartitionName(tableName, partitionDate, usePartmanFormat)
 
 			createTableQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (LIKE %s INCLUDING ALL)", pq.QuoteIdentifier(partitionName), pq.QuoteIdentifier(tableName))
 			if result := tx.Exec(createTableQuery); result.Error != nil {
 				return fmt.Errorf("failed to create partition table %s: %w", partitionName, result.Error)
 			}
 
-			if err := txDBC.AttachPartition(tableName, partitionName, false); err != nil {
+			if err := txDBC.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
 				return fmt.Errorf("failed to attach partition %s: %w", partitionName, err)
 			}
 
@@ -1110,7 +1178,18 @@ func (dbc *DB) GetDetachedPartitionStats(tableName string) (*PartitionStats, err
 	start := time.Now()
 	var stats PartitionStats
 
-	query := `
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build patterns based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
+
+	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
 			SELECT c.relname AS tablename
 			FROM pg_inherits i
@@ -1121,7 +1200,7 @@ func (dbc *DB) GetDetachedPartitionStats(tableName string) (*PartitionStats, err
 		detached_info AS (
 			SELECT
 				tablename,
-				TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date,
+				TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date,
 				pg_total_relation_size('public.'||tablename) AS size_bytes
 			FROM pg_tables
 			WHERE schemaname = 'public'
@@ -1137,9 +1216,8 @@ func (dbc *DB) GetDetachedPartitionStats(tableName string) (*PartitionStats, err
 			COALESCE(AVG(size_bytes), 0)::BIGINT AS avg_size_bytes,
 			COALESCE(pg_size_pretty(AVG(size_bytes)::BIGINT), '0 bytes') AS avg_size_pretty
 		FROM detached_info
-	`
+	`, sqlPattern)
 
-	tablePattern := escapeForLike(tableName) + `\_20%`
 	result := dbc.DB.Raw(query,
 		sql.Named("table_name", tableName),
 		sql.Named("table_pattern", tablePattern)).Scan(&stats)
@@ -1160,18 +1238,24 @@ func (dbc *DB) GetDetachedPartitionStats(tableName string) (*PartitionStats, err
 }
 
 // AttachPartition attaches a partition to the parent table with the appropriate date range
-// The partition name must follow the convention tableName_YYYY_MM_DD
-func (dbc *DB) AttachPartition(tableName, partitionName string, dryRun bool) error {
+// Supports both standard format (tableName_YYYY_MM_DD) and pg_partman format (tableName_pYYYY_MM_DD)
+func (dbc *DB) AttachPartition(tableName, partitionName string, usePartmanFormat bool, dryRun bool) error {
 	start := time.Now()
 
 	// Validate partition name format for safety
 	if !isValidPartitionName(tableName, partitionName) {
-		return fmt.Errorf("invalid partition name: %s - must match %s_YYYY_MM_DD", partitionName, tableName)
+		return fmt.Errorf("invalid partition name: %s - must match %s_YYYY_MM_DD or %s_pYYYY_MM_DD", partitionName, tableName, tableName)
 	}
 
 	// Extract date from partition name
 	prefix := tableName + "_"
 	dateStr := partitionName[len(prefix):]
+
+	// Handle pg_partman format (_pYYYY_MM_DD)
+	if usePartmanFormat && len(dateStr) > 0 && dateStr[0] == 'p' {
+		dateStr = dateStr[1:] // Strip the 'p' prefix
+	}
+
 	partitionDate, err := time.Parse("2006_01_02", dateStr)
 	if err != nil {
 		return fmt.Errorf("invalid partition date format: %w", err)
@@ -1329,50 +1413,121 @@ func (dbc *DB) DetachOldPartitions(tableName string, retentionDays int, dryRun b
 	return detachedCount, nil
 }
 
+// buildPartitionName generates a partition name based on format preference
+func buildPartitionName(tableName string, date time.Time, usePartmanFormat bool) string {
+	dateStr := date.Format("2006_01_02")
+	if usePartmanFormat {
+		return fmt.Sprintf("%s_p%s", tableName, dateStr)
+	}
+	return fmt.Sprintf("%s_%s", tableName, dateStr)
+}
+
+// detectPartitionFormat examines existing partitions to determine naming format
+// Returns true if pg_partman format (_pYYYY_MM_DD), false for standard format
+// Returns error if table not found or has no partitions
+func (dbc *DB) detectPartitionFormat(tableName string) (bool, error) {
+	var partitionName string
+	query := `
+		SELECT c.relname
+		FROM pg_inherits i
+		JOIN pg_class c ON i.inhrelid = c.oid
+		JOIN pg_class p ON i.inhparent = p.oid
+		WHERE p.relname = @table_name
+		LIMIT 1
+	`
+
+	result := dbc.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&partitionName)
+	if result.Error != nil {
+		return false, fmt.Errorf("failed to detect partition format: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		// No partitions found - default to standard format
+		return false, nil
+	}
+
+	// Check if partition name contains _p followed by year (e.g., _p2026)
+	// pg_partman format: tablename_pYYYY_MM_DD
+	// standard format: tablename_YYYY_MM_DD
+	return strings.Contains(partitionName, "_p20"), nil
+}
+
+// getPartitionSQLPattern returns SQL regex pattern for matching partitions
+func getPartitionSQLPattern(usePartmanFormat bool) string {
+	if usePartmanFormat {
+		return "_p(\\d{4}_\\d{2}_\\d{2})$"
+	}
+	return "_(\\d{4}_\\d{2}_\\d{2})$"
+}
+
+// getPartitionLikePattern returns LIKE pattern for partition matching
+func getPartitionLikePattern(tableName string, usePartmanFormat bool) string {
+	if usePartmanFormat {
+		return escapeForLike(tableName) + "\\_p20%"
+	}
+	return escapeForLike(tableName) + "\\_20%"
+}
+
 // extractTableNameFromPartition extracts the table name from a partition name
-// Partition format: {tablename}_YYYY_MM_DD
+// Supports both standard format {tablename}_YYYY_MM_DD and pg_partman format {tablename}_pYYYY_MM_DD
 func extractTableNameFromPartition(partitionName string) (string, error) {
-	// Must end with _YYYY_MM_DD (10 characters + 1 underscore = 11)
+	// Minimum length check (shortest valid: x_2000_01_01 = 12 chars)
 	if len(partitionName) < 12 {
 		return "", fmt.Errorf("partition name too short: %s", partitionName)
 	}
 
-	// Extract the date portion (last 10 characters should be YYYY_MM_DD)
-	dateStr := partitionName[len(partitionName)-10:]
-
-	// Validate date format
-	_, err := time.Parse("2006_01_02", dateStr)
-	if err != nil {
-		return "", fmt.Errorf("invalid date format in partition name: %s", partitionName)
+	// Check for pg_partman format (_pYYYY_MM_DD) - 12 char suffix
+	if len(partitionName) >= 13 && partitionName[len(partitionName)-12] == '_' && partitionName[len(partitionName)-11] == 'p' {
+		dateStr := partitionName[len(partitionName)-10:]
+		if _, err := time.Parse("2006_01_02", dateStr); err == nil {
+			// Valid pg_partman format
+			return partitionName[:len(partitionName)-12], nil
+		}
 	}
 
-	// Table name is everything except the last 11 characters (_YYYY_MM_DD)
-	tableName := partitionName[:len(partitionName)-11]
+	// Check for standard format (_YYYY_MM_DD) - 11 char suffix
+	if len(partitionName) >= 11 {
+		dateStr := partitionName[len(partitionName)-10:]
+		if _, err := time.Parse("2006_01_02", dateStr); err == nil {
+			// Valid standard format
+			return partitionName[:len(partitionName)-11], nil
+		}
+	}
 
-	return tableName, nil
+	return "", fmt.Errorf("invalid partition name format: %s (expected tablename_YYYY_MM_DD or tablename_pYYYY_MM_DD)", partitionName)
 }
 
 // isValidPartitionName validates that a partition name matches the expected format for a given table
+// Supports both standard format (tablename_YYYY_MM_DD) and pg_partman format (tablename_pYYYY_MM_DD)
 // This is a safety check to prevent SQL injection and accidental drops
 func isValidPartitionName(tableName, partitionName string) bool {
 	expectedPrefix := tableName + "_"
-	expectedLen := len(expectedPrefix) + 10 // prefix + "YYYY_MM_DD"
-
-	if len(partitionName) != expectedLen {
-		return false
-	}
 
 	if !strings.HasPrefix(partitionName, expectedPrefix) {
 		return false
 	}
 
-	// Must start with 20xx (year 2000-2099)
-	if len(partitionName) < len(expectedPrefix)+2 || partitionName[len(expectedPrefix):len(expectedPrefix)+2] != "20" {
-		return false
+	// Check pg_partman format: tablename_pYYYY_MM_DD (length = prefix + 1 + 10)
+	expectedLenPartman := len(expectedPrefix) + 11
+	if len(partitionName) == expectedLenPartman && partitionName[len(expectedPrefix)] == 'p' {
+		// Must start with p20xx (year 2000-2099)
+		if len(partitionName) >= len(expectedPrefix)+3 && partitionName[len(expectedPrefix)+1:len(expectedPrefix)+3] == "20" {
+			dateStr := partitionName[len(expectedPrefix)+1:] // YYYY_MM_DD format
+			_, err := time.Parse("2006_01_02", dateStr)
+			return err == nil
+		}
 	}
 
-	// Validate date format by parsing
-	dateStr := partitionName[len(expectedPrefix):] // YYYY_MM_DD format
-	_, err := time.Parse("2006_01_02", dateStr)
-	return err == nil
+	// Check standard format: tablename_YYYY_MM_DD (length = prefix + 10)
+	expectedLenStandard := len(expectedPrefix) + 10
+	if len(partitionName) == expectedLenStandard {
+		// Must start with 20xx (year 2000-2099)
+		if len(partitionName) >= len(expectedPrefix)+2 && partitionName[len(expectedPrefix):len(expectedPrefix)+2] == "20" {
+			dateStr := partitionName[len(expectedPrefix):] // YYYY_MM_DD format
+			_, err := time.Parse("2006_01_02", dateStr)
+			return err == nil
+		}
+	}
+
+	return false
 }

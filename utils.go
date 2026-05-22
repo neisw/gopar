@@ -640,13 +640,29 @@ type partitionDateInfo struct {
 }
 
 // getPartitionsInDateRange returns all partitions that cover a date range
-// Assumes daily partitions with naming convention: tablename_YYYY_MM_DD
+// Supports both standard format (tablename_YYYY_MM_DD) and pg_partman format (tablename_pYYYY_MM_DD)
 func (dbc *DB) getPartitionsInDateRange(tableName string, startDate, endDate time.Time) ([]partitionDateInfo, error) {
 	var partitions []partitionDateInfo
 
+	// Detect partition format
+	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
+		usePartmanFormat = false
+	}
+
+	// Build patterns based on detected format
+	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	var regexPattern string
+	if usePartmanFormat {
+		regexPattern = tableName + "_p\\d{4}_\\d{2}_\\d{2}$"
+	} else {
+		regexPattern = tableName + "_\\d{4}_\\d{2}_\\d{2}$"
+	}
+
 	// Query only attached partitions using pg_inherits
 	// Detached partitions won't appear in pg_inherits
-	query := `
+	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
 			SELECT c.relname AS tablename
 			FROM pg_inherits i
@@ -656,15 +672,13 @@ func (dbc *DB) getPartitionsInDateRange(tableName string, startDate, endDate tim
 		)
 		SELECT
 			tablename AS partition_name,
-			TO_DATE(SUBSTRING(tablename FROM '_(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD') AS partition_date
+			TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') AS partition_date
 		FROM pg_tables
 		WHERE schemaname = 'public'
 			AND tablename IN (SELECT tablename FROM attached_partitions)
 			AND tablename ~ @regex_pattern
 		ORDER BY partition_date
-	`
-
-	regexPattern := tableName + "_\\d{4}_\\d{2}_\\d{2}$"
+	`, sqlPattern)
 
 	result := dbc.DB.Raw(query,
 		sql.Named("table_name", tableName),
