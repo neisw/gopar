@@ -1,0 +1,37 @@
+[
+  {
+    "name": "backfill_prow_job_runs",
+    "description": "Backfill denormalized prow_job_release column from prow_jobs table",
+    "concurrent": true,
+    "batchSize": 500000,
+    "query": "WITH batch AS (\n\t\t\t\tSELECT id FROM prow_job_runs\n\t\t\t\tWHERE prow_job_release IS NULL OR prow_job_release = ''\n\t\t\t\tLIMIT $1\n\t\t\t)\n\t\t\tUPDATE prow_job_runs r\n\t\t\tSET prow_job_release = j.release\n\t\t\tFROM prow_jobs j, batch\n\t\t\tWHERE r.id = batch.id\n\t\t\tAND r.prow_job_id = j.id"
+  },
+  {
+    "name": "backfill_prow_job_run_tests",
+    "description": "Backfill denormalized prow_job_id, prow_job_run_release, and prow_job_run_timestamp columns",
+    "concurrent": true,
+    "batchSize": 500000,
+    "query": "WITH batch AS (\n\t\t\t\tSELECT id FROM prow_job_run_tests\n\t\t\t\tWHERE prow_job_run_release IS NULL OR prow_job_run_release = ''\n\t\t\t\tLIMIT $1\n\t\t\t)\n\t\t\tUPDATE prow_job_run_tests t\n\t\t\tSET prow_job_id = r.prow_job_id,\n\t\t\t\tprow_job_run_release = j.release,\n\t\t\t\tprow_job_run_timestamp = r.\"timestamp\"\n\t\t\tFROM prow_job_runs r\n\t\t\tJOIN prow_jobs j ON r.prow_job_id = j.id\n\t\t\t, batch\n\t\t\tWHERE t.prow_job_run_id = r.id\n\t\t\tAND t.id = batch.id"
+  },
+  {
+    "name": "backfill_prow_job_run_test_outputs",
+    "description": "Backfill denormalized prow_job_run_test_release and prow_job_run_test_timestamp columns",
+    "concurrent": true,
+    "batchSize": 500000,
+    "query": "WITH batch AS (\n\t\t\t\tSELECT id FROM prow_job_run_test_outputs\n\t\t\t\tWHERE prow_job_run_test_release IS NULL OR prow_job_run_test_release = ''\n\t\t\t\tLIMIT $1\n\t\t\t)\n\t\t\tUPDATE prow_job_run_test_outputs o\n\t\t\tSET prow_job_run_test_release = j.release,\n\t\t\t\tprow_job_run_test_timestamp = r.\"timestamp\"\n\t\t\tFROM prow_job_run_tests t\n\t\t\tJOIN prow_job_runs r ON t.prow_job_run_id = r.id\n\t\t\tJOIN prow_jobs j ON r.prow_job_id = j.id\n\t\t\t, batch\n\t\t\tWHERE o.prow_job_run_test_id = t.id\n\t\t\tAND o.id = batch.id"
+  },
+  {
+    "name": "backfill_prow_job_run_prow_pull_requests",
+    "description": "Backfill denormalized prow_job_run_release and prow_job_run_timestamp columns in join table",
+    "concurrent": true,
+    "batchSize": 500000,
+    "query": "WITH batch AS (\n\t\t\t\tSELECT prow_job_run_id, prow_pull_request_id FROM prow_job_run_prow_pull_requests\n\t\t\t\tWHERE prow_job_run_release IS NULL OR prow_job_run_release = ''\n\t\t\t\tLIMIT $1\n\t\t\t)\n\t\t\tUPDATE prow_job_run_prow_pull_requests pp\n\t\t\tSET prow_job_run_release = j.release,\n\t\t\t\tprow_job_run_timestamp = r.\"timestamp\"\n\t\t\tFROM prow_job_runs r\n\t\t\tJOIN prow_jobs j ON r.prow_job_id = j.id\n\t\t\t, batch\n\t\t\tWHERE pp.prow_job_run_id = r.id\n\t\t\tAND pp.prow_job_run_id = batch.prow_job_run_id\n\t\t\tAND pp.prow_pull_request_id = batch.prow_pull_request_id"
+  },
+  {
+    "name": "backfill_prow_job_run_annotations",
+    "description": "Backfill denormalized prow_job_run_release and prow_job_run_timestamp columns",
+    "concurrent": true,
+    "batchSize": 500000,
+    "query": "WITH batch AS (\n\t\t\t\tSELECT id FROM prow_job_run_annotations\n\t\t\t\tWHERE prow_job_run_release IS NULL OR prow_job_run_release = ''\n\t\t\t\tLIMIT $1\n\t\t\t)\n\t\t\tUPDATE prow_job_run_annotations a\n\t\t\tSET prow_job_run_release = j.release,\n\t\t\t\tprow_job_run_timestamp = r.\"timestamp\"\n\t\t\tFROM prow_job_runs r\n\t\t\tJOIN prow_jobs j ON r.prow_job_id = j.id\n\t\t\t, batch\n\t\t\tWHERE a.prow_job_run_id = r.id\n\t\t\tAND a.id = batch.id"
+  }
+]

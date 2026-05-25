@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/neisw/gopar/partitioning"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -20,18 +21,6 @@ type ColumnInfo struct {
 	OrdinalPos    int
 }
 
-// PartitionStrategy defines the partitioning strategy type
-type PartitionStrategy string
-
-const (
-	// PartitionStrategyRange partitions by value ranges (e.g., date ranges)
-	PartitionStrategyRange PartitionStrategy = "RANGE"
-	// PartitionStrategyList partitions by discrete value lists
-	PartitionStrategyList PartitionStrategy = "LIST"
-	// PartitionStrategyHash partitions by hash of partition key
-	PartitionStrategyHash PartitionStrategy = "HASH"
-)
-
 // ColumnVerificationOptions controls which aspects of column definitions to verify
 type ColumnVerificationOptions struct {
 	// CheckNullable verifies that columns have matching nullable constraints
@@ -42,6 +31,42 @@ type ColumnVerificationOptions struct {
 	CheckOrder bool
 	// OmitColumns lists column names to exclude from verification
 	OmitColumns []string
+}
+
+// normalizeDataType normalizes data type strings for comparison
+// Preserves type modifiers (length, precision, scale) while normalizing base type names
+func normalizeDataType(dataType string) string {
+	dataType = strings.ToLower(strings.TrimSpace(dataType))
+
+	// Map common type variations to standard forms (preserving any modifiers).
+	// Uses a slice for deterministic matching order — longer prefixes must come
+	// before shorter ones (e.g., "character varying" before "character").
+	replacements := []struct{ old, new string }{
+		{"character varying", "varchar"},
+		{"timestamp without time zone", "timestamp"},
+		{"timestamp with time zone", "timestamptz"},
+		{"time without time zone", "time"},
+		{"time with time zone", "timetz"},
+		{"double precision", "float8"},
+		{"character", "char"},
+		{"integer", "int"},
+		{"int4", "int"},
+		{"int8", "bigint"},
+		{"bigserial", "bigint"},
+		{"serial", "int"},
+		{"smallint", "int2"},
+		{"boolean", "bool"},
+		{"real", "float4"},
+	}
+
+	// Try to replace the base type name while preserving modifiers
+	for _, r := range replacements {
+		if suffix, found := strings.CutPrefix(dataType, r.old); found {
+			return r.new + suffix
+		}
+	}
+
+	return dataType
 }
 
 // DataMigrationColumnVerificationOptions returns options suitable for data migrations
@@ -459,7 +484,7 @@ func (dbc *DB) MigrateTableDataRange(sourceTable, targetTable, dateColumn string
 		}).Info("target table is partitioned - verifying partition coverage")
 
 		// For RANGE partitioned tables, verify that partitions exist for the date range
-		if partitionStrategy == PartitionStrategyRange {
+		if partitionStrategy == partitioning.PartitionStrategyRange {
 			if err := dbc.VerifyPartitionCoverage(targetTable, startDate, endDate); err != nil {
 				return 0, fmt.Errorf("partition coverage verification failed: %w", err)
 			}
@@ -599,10 +624,10 @@ func (dbc *DB) MigrateTableDataRange(sourceTable, targetTable, dateColumn string
 //	if err != nil {
 //	    return err
 //	}
-//	if strategy == PartitionStrategyRange {
+//	if strategy == partitioning.PartitionStrategyRange {
 //	    // Handle RANGE partitioned table
 //	}
-func (dbc *DB) GetPartitionStrategy(tableName string) (PartitionStrategy, error) {
+func (dbc *DB) GetPartitionStrategy(tableName string) (partitioning.PartitionStrategy, error) {
 	var strategy string
 
 	query := `
@@ -630,7 +655,7 @@ func (dbc *DB) GetPartitionStrategy(tableName string) (PartitionStrategy, error)
 		return "", nil
 	}
 
-	return PartitionStrategy(strategy), nil
+	return partitioning.PartitionStrategy(strategy), nil
 }
 
 // partitionDateInfo holds date range information for a partition
@@ -645,14 +670,14 @@ func (dbc *DB) getPartitionsInDateRange(tableName string, startDate, endDate tim
 	var partitions []partitionDateInfo
 
 	// Detect partition format
-	usePartmanFormat, err := dbc.detectPartitionFormat(tableName)
+	usePartmanFormat, err := dbc.Partitions().DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
 	// Build patterns based on detected format
-	sqlPattern := getPartitionSQLPattern(usePartmanFormat)
+	sqlPattern := partitioning.GetPartitionSQLPattern(usePartmanFormat)
 	var regexPattern string
 	if usePartmanFormat {
 		regexPattern = tableName + "_p\\d{4}_\\d{2}_\\d{2}$"
@@ -1049,7 +1074,7 @@ func (dbc *DB) MoveForeignKeys(fromTable, toTable string, dryRun bool) (int, err
 	// Check if toTable is partitioned and get its partition columns
 	var toTablePartitionCols []string
 	if !dropOnly {
-		toTablePartitionCols, _ = dbc.getPartitionColumns(toTable)
+		toTablePartitionCols, _ = dbc.Partitions().GetPartitionColumns(toTable)
 		if len(toTablePartitionCols) > 0 {
 			log.WithFields(log.Fields{
 				"table":             toTable,

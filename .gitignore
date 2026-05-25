@@ -28,3 +28,17 @@ go.work.sum
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Build artifacts
+build/
+dist/
+
+# Coverage files
+coverage.out
+coverage.html
+coverage/
+
+# Compiled CLI binaries
+/gopar
+/gopar_*
+*.exe

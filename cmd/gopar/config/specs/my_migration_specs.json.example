@@ -1,0 +1,14 @@
+[
+  {
+    "name": "add_user_email_index",
+    "description": "Add index on users.email for faster lookups",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email\n    ON users (email)"
+  },
+  {
+    "name": "add_created_at_column",
+    "description": "Add created_at timestamp column to orders table",
+    "concurrent": false,
+    "query": "ALTER TABLE orders\n    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"
+  }
+]

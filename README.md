@@ -23,9 +23,45 @@ You should create your partitioned tables using standard DDL or GORM AutoMigrate
 
 ## Installation
 
+### As a Library
+
 ```bash
 go get github.com/neisw/gopar
 ```
+
+### CLI Tool
+
+```bash
+# Install from source
+make install
+
+# Or build locally
+make build
+# Binary will be in ./build/gopar
+```
+
+## Building and Testing
+
+This project includes a comprehensive Makefile for building, testing, and running the CLI:
+
+```bash
+# Show all available targets
+make help
+
+# Build the CLI
+make build
+
+# Run tests
+make test
+
+# Run with example specs
+make run
+
+# Build for all platforms
+make build-all
+```
+
+See [MAKEFILE_USAGE.md](MAKEFILE_USAGE.md) for detailed Makefile documentation.
 
 ## Requirements
 

@@ -1,4 +1,4 @@
-package gopar
+package partitioning
 
 import (
 	"database/sql"
@@ -12,7 +12,7 @@ import (
 
 // GetPartitionHierarchy returns the complete partition hierarchy for a table
 // including intermediate partitions and leaf partitions
-func (dbc *DB) GetPartitionHierarchy(tableName string) ([]PartitionHierarchyInfo, error) {
+func (dbp *DB_PARTITIONS) GetPartitionHierarchy(tableName string) ([]PartitionHierarchyInfo, error) {
 	start := time.Now()
 
 	// Recursive query to get full hierarchy
@@ -90,7 +90,7 @@ func (dbc *DB) GetPartitionHierarchy(tableName string) ([]PartitionHierarchyInfo
 		RowEstimate     int64
 	}
 
-	result := dbc.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&results)
+	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&results)
 	if result.Error != nil {
 		return nil, fmt.Errorf("failed to query partition hierarchy: %w", result.Error)
 	}
@@ -142,7 +142,7 @@ func (dbc *DB) GetPartitionHierarchy(tableName string) ([]PartitionHierarchyInfo
 
 // ListLeafPartitions returns only the leaf partitions (those that actually hold data)
 // for a partitioned table, regardless of nesting level
-func (dbc *DB) ListLeafPartitions(tableName string) ([]PartitionHierarchyInfo, error) {
+func (dbp *DB_PARTITIONS) ListLeafPartitions(tableName string) ([]PartitionHierarchyInfo, error) {
 	start := time.Now()
 
 	query := `
@@ -197,7 +197,7 @@ func (dbc *DB) ListLeafPartitions(tableName string) ([]PartitionHierarchyInfo, e
 		PartitionBounds sql.NullString
 	}
 
-	result := dbc.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&results)
+	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&results)
 	if result.Error != nil {
 		return nil, fmt.Errorf("failed to query leaf partitions: %w", result.Error)
 	}
@@ -242,7 +242,7 @@ func (dbc *DB) ListLeafPartitions(tableName string) ([]PartitionHierarchyInfo, e
 
 // GetPartitionLevel returns the nesting level of a partition
 // Returns 0 for the root table, 1 for first-level partitions, etc.
-func (dbc *DB) GetPartitionLevel(partitionName string) (int, error) {
+func (dbp *DB_PARTITIONS) GetPartitionLevel(partitionName string) (int, error) {
 	query := `
 		WITH RECURSIVE partition_path AS (
 			SELECT
@@ -266,7 +266,7 @@ func (dbc *DB) GetPartitionLevel(partitionName string) (int, error) {
 	`
 
 	var level int
-	result := dbc.DB.Raw(query, sql.Named("partition_name", partitionName)).Scan(&level)
+	result := dbp.DB.Raw(query, sql.Named("partition_name", partitionName)).Scan(&level)
 	if result.Error != nil {
 		return 0, fmt.Errorf("failed to get partition level: %w", result.Error)
 	}
@@ -302,7 +302,7 @@ func extractDateFromPartitionName(partitionName string) *time.Time {
 }
 
 // partitionExists checks if a partition table exists
-func (dbc *DB) partitionExists(partitionName string) (bool, error) {
+func (dbp *DB_PARTITIONS) partitionExists(partitionName string) (bool, error) {
 	var exists bool
 	query := `
 		SELECT EXISTS (
@@ -312,13 +312,13 @@ func (dbc *DB) partitionExists(partitionName string) (bool, error) {
 		)
 	`
 
-	result := dbc.DB.Raw(query, sql.Named("partition_name", partitionName)).Scan(&exists)
+	result := dbp.DB.Raw(query, sql.Named("partition_name", partitionName)).Scan(&exists)
 	return exists, result.Error
 }
 
 // CreateMissingPartitionsListToRange creates LIST → RANGE nested partitions
 // For each release value, creates an intermediate partition that is RANGE-partitioned by date
-func (dbc *DB) CreateMissingPartitionsListToRange(
+func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 	tableName string,
 	releases []string, // List of release names (e.g., ["v1.0", "v2.0", "v3.0"])
 	startDate, endDate time.Time,
@@ -345,7 +345,7 @@ func (dbc *DB) CreateMissingPartitionsListToRange(
 		intermediatePartition := fmt.Sprintf("%s_%s", tableName, safeName)
 
 		// Check if intermediate partition already exists
-		exists, err := dbc.partitionExists(intermediatePartition)
+		exists, err := dbp.partitionExists(intermediatePartition)
 		if err != nil {
 			return createdCount, fmt.Errorf("failed to check if %s exists: %w", intermediatePartition, err)
 		}
@@ -358,7 +358,7 @@ func (dbc *DB) CreateMissingPartitionsListToRange(
 					"release":   release,
 				}).Info("[DRY RUN] would create intermediate LIST partition with RANGE sub-partitioning")
 			} else {
-				err := dbc.createListMemberWithRangeSubPartitions(
+				err := dbp.createListMemberWithRangeSubPartitions(
 					tableName,
 					intermediatePartition,
 					release,
@@ -374,7 +374,7 @@ func (dbc *DB) CreateMissingPartitionsListToRange(
 
 		// Create daily partitions under this release
 		if !dryRun {
-			dailyCount, err := dbc.createDailyPartitionsUnder(
+			dailyCount, err := dbp.createDailyPartitionsUnder(
 				intermediatePartition,
 				startDate,
 				endDate,
@@ -397,7 +397,7 @@ func (dbc *DB) CreateMissingPartitionsListToRange(
 }
 
 // createListMemberWithRangeSubPartitions creates a LIST partition member that is itself RANGE-partitioned
-func (dbc *DB) createListMemberWithRangeSubPartitions(
+func (dbp *DB_PARTITIONS) createListMemberWithRangeSubPartitions(
 	parentTable string,
 	partitionName string,
 	listValue string,
@@ -422,7 +422,7 @@ func (dbc *DB) createListMemberWithRangeSubPartitions(
 		"value":     listValue,
 	}).Debug("creating LIST member with RANGE sub-partitioning")
 
-	result := dbc.DB.Exec(sql)
+	result := dbp.DB.Exec(sql)
 	if result.Error != nil {
 		return fmt.Errorf("failed to execute CREATE TABLE: %w", result.Error)
 	}
@@ -431,7 +431,7 @@ func (dbc *DB) createListMemberWithRangeSubPartitions(
 }
 
 // createDailyPartitionsUnder creates daily RANGE partitions under an intermediate partition
-func (dbc *DB) createDailyPartitionsUnder(
+func (dbp *DB_PARTITIONS) createDailyPartitionsUnder(
 	intermediatePartition string,
 	startDate, endDate time.Time,
 	usePartmanFormat bool,
@@ -455,7 +455,7 @@ func (dbc *DB) createDailyPartitionsUnder(
 		}
 
 		// Check if daily partition already exists
-		exists, err := dbc.partitionExists(dailyPartition)
+		exists, err := dbp.partitionExists(dailyPartition)
 		if err != nil {
 			return createdCount, err
 		}
@@ -476,7 +476,7 @@ func (dbc *DB) createDailyPartitionsUnder(
 					pq.QuoteLiteral(nextDate.Format("2006-01-02")),
 				)
 
-				result := dbc.DB.Exec(sql)
+				result := dbp.DB.Exec(sql)
 				if result.Error != nil {
 					return createdCount, fmt.Errorf("failed to create daily partition %s: %w", dailyPartition, result.Error)
 				}
@@ -517,7 +517,7 @@ func sanitizePartitionName(name string) string {
 }
 
 // GetDailyPartitionsForRelease returns all daily partitions for a specific release
-func (dbc *DB) GetDailyPartitionsForRelease(
+func (dbp *DB_PARTITIONS) GetDailyPartitionsForRelease(
 	tableName string,
 	release string,
 ) ([]PartitionHierarchyInfo, error) {
@@ -552,7 +552,7 @@ func (dbc *DB) GetDailyPartitionsForRelease(
 		RowEstimate     int64
 	}
 
-	result := dbc.DB.Raw(query, sql.Named("intermediate_partition", intermediatePartition)).Scan(&partitions)
+	result := dbp.DB.Raw(query, sql.Named("intermediate_partition", intermediatePartition)).Scan(&partitions)
 
 	if result.Error != nil {
 		return nil, fmt.Errorf("failed to get daily partitions for release %s: %w", release, result.Error)

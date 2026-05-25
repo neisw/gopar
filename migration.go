@@ -124,7 +124,7 @@ func (dbc *DB) MigrateToPartitionedTableWithConfig(cfg MigrationConfig) error {
 		"partition_end":   partitionEnd.Format("2006-01-02"),
 	}).Info("creating partitions")
 
-	created, err := dbc.CreateMissingPartitions(targetTable, partitionStart.AddDate(0, 0, -1), partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
+	created, err := dbc.Partitions().CreateMissingPartitions(targetTable, partitionStart.AddDate(0, 0, -1), partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to create partitions: %w", err)
 	}
@@ -230,7 +230,7 @@ func (dbc *DB) UpdatePartitionedTableMigrationWithConfig(cfg MigrationConfig) er
 	partitionStart := maxDate.UTC().Truncate(24 * time.Hour)
 	partitionEnd := cfg.MigrateUpTo.AddDate(0, 0, 7)
 
-	created, err := dbc.CreateMissingPartitions(targetTable, partitionStart, partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
+	created, err := dbc.Partitions().CreateMissingPartitions(targetTable, partitionStart, partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to create missing partitions: %w", err)
 	}
@@ -335,7 +335,7 @@ func (dbc *DB) FinalizePartitionedTableMigrationWithConfig(cfg MigrationConfig) 
 	partitionEnd := cfg.MigrateUpTo.AddDate(0, 0, 7)
 	partitionStart := migrateFrom.UTC().Truncate(24 * time.Hour)
 
-	created, err := dbc.CreateMissingPartitions(partitionedTable, partitionStart, partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
+	created, err := dbc.Partitions().CreateMissingPartitions(partitionedTable, partitionStart, partitionEnd, cfg.UsePartmanFormat, cfg.DryRun)
 	if err != nil {
 		return fmt.Errorf("failed to create partitions: %w", err)
 	}
@@ -433,7 +433,7 @@ func (dbc *DB) AnalyzePartitioningImpact(tableName string) error {
 	l.Info("analyzing partitioning impact")
 
 	// Check if the table is already partitioned
-	tablePartCols, _ := dbc.getPartitionColumns(tableName)
+	tablePartCols, _ := dbc.Partitions().GetPartitionColumns(tableName)
 	if len(tablePartCols) > 0 {
 		l.WithField("partition_columns", tablePartCols).Info("table is already partitioned")
 	}
@@ -464,7 +464,7 @@ func (dbc *DB) AnalyzePartitioningImpact(tableName string) error {
 			// Outbound FK: this table references another table
 			fields["direction"] = "outbound"
 
-			refPartCols, _ := dbc.getPartitionColumns(fk.ReferencedTable)
+			refPartCols, _ := dbc.Partitions().GetPartitionColumns(fk.ReferencedTable)
 			fields["referenced_table_partitioned"] = len(refPartCols) > 0
 
 			if len(refPartCols) == 0 {
@@ -484,7 +484,7 @@ func (dbc *DB) AnalyzePartitioningImpact(tableName string) error {
 			// Inbound FK: another table references this table
 			fields["direction"] = "inbound"
 
-			srcPartCols, _ := dbc.getPartitionColumns(fk.SourceTable)
+			srcPartCols, _ := dbc.Partitions().GetPartitionColumns(fk.SourceTable)
 			fields["source_table_partitioned"] = len(srcPartCols) > 0
 
 			// When this table becomes partitioned, its PK will include the partition
