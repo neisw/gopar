@@ -957,6 +957,14 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 			endDate.Format("2006-01-02"), startDate.Format("2006-01-02"))
 	}
 
+	// Validate that partition names will fit within PostgreSQL's identifier limit
+	maxName := len(tableName) + dateSuffixLen(usePartmanFormat)
+	if maxName > maxPartitionNameLen {
+		return 0, fmt.Errorf(
+			"partition names for table %q would be %d characters (limit %d); shorten the table name",
+			tableName, maxName, maxPartitionNameLen)
+	}
+
 	// Get list of all existing partitions (attached + detached)
 	existingPartitions, err := dbp.ListTablePartitions(tableName)
 	if err != nil {

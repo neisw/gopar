@@ -3,12 +3,90 @@ package partitioning
 import (
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
 	"github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 )
+
+// maxPartitionNameLen is the safe maximum for partition table names.
+// PostgreSQL identifiers can be up to 63 characters (NAMEDATALEN-1), but
+// internally PG creates an array type prefixed with "_". A 63-character
+// table name produces a 64-character array type name which exceeds the
+// limit, causing SQLSTATE 42710. We cap at 62 to leave room.
+const maxPartitionNameLen = 62
+
+// hashSuffixLen is the length of the "_xxxx" hash suffix appended when
+// a table name prefix must be shortened (underscore + 4 hex digits).
+const hashSuffixLen = 5
+
+func validatePartitionNameLength(name string) error {
+	if len(name) > maxPartitionNameLen {
+		return fmt.Errorf("partition name %q is %d characters, exceeds safe limit of %d",
+			name, len(name), maxPartitionNameLen)
+	}
+	return nil
+}
+
+// dateSuffixLen is the length added by a daily partition date suffix: "_YYYY_MM_DD" (11) or "_pYYYY_MM_DD" (12)
+func dateSuffixLen(usePartmanFormat bool) int {
+	if usePartmanFormat {
+		return 12
+	}
+	return 11
+}
+
+// shortenTablePrefix truncates a table name prefix to fit within maxLen and
+// appends a 4-hex-digit FNV hash of the original name for uniqueness.
+// If the name already fits it is returned unchanged.
+//
+// Example:
+//
+//	shortenTablePrefix("prow_job_run_annotations_new", 20)
+//	→ "prow_job_run_an_8f3a"   (15 chars of prefix + "_" + 4 hex = 20)
+func shortenTablePrefix(name string, maxLen int) string {
+	if len(name) <= maxLen {
+		return name
+	}
+
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	hash := fmt.Sprintf("%04x", h.Sum32()&0xFFFF)
+
+	truncLen := maxLen - hashSuffixLen
+	if truncLen < 1 {
+		truncLen = 1
+	}
+
+	// Avoid ending on an underscore before the hash separator
+	prefix := name[:truncLen]
+	prefix = strings.TrimRight(prefix, "_")
+
+	return prefix + "_" + hash
+}
+
+// buildNestedPartitionPrefix computes the intermediate partition prefix for a
+// given table and release name, shortening the table name if the resulting
+// daily partition names would exceed PostgreSQL's identifier limit.
+// Returns the intermediate prefix and the (possibly shortened) table prefix.
+func buildNestedPartitionPrefix(tableName, release string, usePartmanFormat bool) string {
+	safeName := sanitizePartitionName(release)
+	full := tableName + "_" + safeName
+
+	// Check if the longest daily name fits
+	maxDaily := len(full) + dateSuffixLen(usePartmanFormat)
+	if maxDaily <= maxPartitionNameLen {
+		return full
+	}
+
+	// Calculate how much space the table prefix can use:
+	// total = tablePrefix + "_" + safeName + dateSuffix
+	available := maxPartitionNameLen - dateSuffixLen(usePartmanFormat) - 1 - len(safeName)
+	shortened := shortenTablePrefix(tableName, available)
+	return shortened + "_" + safeName
+}
 
 // GetPartitionHierarchy returns the complete partition hierarchy for a table
 // including intermediate partitions and leaf partitions
@@ -340,9 +418,14 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 
 	// For each release, create intermediate partition and its daily sub-partitions
 	for _, release := range releases {
-		// Sanitize release name for table naming (replace dots, spaces, etc.)
-		safeName := sanitizePartitionName(release)
-		intermediatePartition := fmt.Sprintf("%s_%s", tableName, safeName)
+		intermediatePartition := buildNestedPartitionPrefix(tableName, release, usePartmanFormat)
+
+		if intermediatePartition != tableName+"_"+sanitizePartitionName(release) {
+			l.WithFields(log.Fields{
+				"original":  tableName + "_" + sanitizePartitionName(release),
+				"shortened": intermediatePartition,
+			}).Info("shortened partition prefix to fit PostgreSQL identifier limit")
+		}
 
 		// Check if intermediate partition already exists
 		exists, err := dbp.partitionExists(intermediatePartition)
@@ -409,7 +492,7 @@ func (dbp *DB_PARTITIONS) createListMemberWithRangeSubPartitions(
 	//   PARTITION BY RANGE (event_date);
 
 	sql := fmt.Sprintf(
-		"CREATE TABLE %s PARTITION OF %s FOR VALUES IN (%s) PARTITION BY RANGE (%s)",
+		"CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES IN (%s) PARTITION BY RANGE (%s)",
 		pq.QuoteIdentifier(partitionName),
 		pq.QuoteIdentifier(parentTable),
 		pq.QuoteLiteral(listValue),
@@ -454,6 +537,10 @@ func (dbp *DB_PARTITIONS) createDailyPartitionsUnder(
 			dailyPartition = fmt.Sprintf("%s_%s", intermediatePartition, currentDate.Format("2006_01_02"))
 		}
 
+		if err := validatePartitionNameLength(dailyPartition); err != nil {
+			return createdCount, err
+		}
+
 		// Check if daily partition already exists
 		exists, err := dbp.partitionExists(dailyPartition)
 		if err != nil {
@@ -469,7 +556,7 @@ func (dbp *DB_PARTITIONS) createDailyPartitionsUnder(
 				//   FOR VALUES FROM ('2024-01-01') TO ('2024-01-02');
 
 				sql := fmt.Sprintf(
-					"CREATE TABLE %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)",
+					"CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)",
 					pq.QuoteIdentifier(dailyPartition),
 					pq.QuoteIdentifier(intermediatePartition),
 					pq.QuoteLiteral(currentDate.Format("2006-01-02")),
@@ -520,9 +607,9 @@ func sanitizePartitionName(name string) string {
 func (dbp *DB_PARTITIONS) GetDailyPartitionsForRelease(
 	tableName string,
 	release string,
+	usePartmanFormat bool,
 ) ([]PartitionHierarchyInfo, error) {
-	safeName := sanitizePartitionName(release)
-	intermediatePartition := fmt.Sprintf("%s_%s", tableName, safeName)
+	intermediatePartition := buildNestedPartitionPrefix(tableName, release, usePartmanFormat)
 
 	// Get all children of the intermediate partition
 	query := `
