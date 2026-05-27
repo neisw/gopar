@@ -164,15 +164,15 @@ run: build
 	@echo "Running $(BINARY_NAME) with example spec file..."
 	$(BUILD_DIR)/$(BINARY_NAME) sql \
 		--dsn "host=localhost user=postgres dbname=testdb" \
-		--spec-file cmd/gopar/config/specs/example_sql_specs.json \
+		--spec-file config/specs/example_sql_specs.json \
 		--dry-run
 
-## run-prow: Build and run with prow_job_runs_backfill.json (dry-run)
+## run-prow: Build and run with prow backfill specs (dry-run)
 run-prow: build
 	@echo "Running $(BINARY_NAME) with Prow backfill specs..."
 	$(BUILD_DIR)/$(BINARY_NAME) sql \
 		--dsn "host=localhost user=postgres dbname=testdb" \
-		--spec-file cmd/gopar/config/specs/prow_job_runs_backfill.json \
+		--spec-file config/specs/prowjobruns/001_prow_job_runs_backfill.json \
 		--dry-run
 
 ## version: Display version information
@@ -195,7 +195,7 @@ ci: fmt vet test-coverage
 ## spec-files: List all SQL spec files
 spec-files:
 	@echo "SQL Specification Files:"
-	@find cmd/gopar/config/specs -name "*.json*" -type f | sort
+	@find config/specs -name "*.json" -type f | sort
 
 ## examples: Show example commands
 examples:

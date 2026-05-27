@@ -2,6 +2,7 @@ package partitioning
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -440,6 +441,7 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 					"partition": intermediatePartition,
 					"release":   release,
 				}).Info("[DRY RUN] would create intermediate LIST partition with RANGE sub-partitioning")
+				createdCount++
 			} else {
 				err := dbp.createListMemberWithRangeSubPartitions(
 					tableName,
@@ -448,11 +450,31 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 					dateColumn,
 				)
 				if err != nil {
-					return createdCount, fmt.Errorf("failed to create intermediate partition %s: %w", intermediatePartition, err)
+					// SQLSTATE 42P17 = partition overlap. This happens when a
+					// partition for this list value already exists under a
+					// different name — e.g. after a table rename where a
+					// hash-shortened name no longer matches the computed name.
+					var pqErr *pq.Error
+					if errors.As(err, &pqErr) && pqErr.Code == "42P17" {
+						existingName, findErr := dbp.findPartitionForListValue(tableName, release)
+						if findErr == nil && existingName != "" {
+							l.WithFields(log.Fields{
+								"computed": intermediatePartition,
+								"existing": existingName,
+								"release":  release,
+							}).Warn("partition for list value already exists under a different name, using existing partition")
+							intermediatePartition = existingName
+						} else {
+							return createdCount, fmt.Errorf("failed to create intermediate partition %s: %w", intermediatePartition, err)
+						}
+					} else {
+						return createdCount, fmt.Errorf("failed to create intermediate partition %s: %w", intermediatePartition, err)
+					}
+				} else {
+					l.WithField("partition", intermediatePartition).Info("created intermediate partition")
+					createdCount++
 				}
-				l.WithField("partition", intermediatePartition).Info("created intermediate partition")
 			}
-			createdCount++
 		}
 
 		// Create daily partitions under this release
@@ -477,6 +499,31 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 
 	l.WithField("total_created", createdCount).Info("completed LIST → RANGE partition creation")
 	return createdCount, nil
+}
+
+// findPartitionForListValue finds an existing partition of parentTable whose
+// list bounds match the given value. Returns the partition name or "" if none found.
+func (dbp *DB_PARTITIONS) findPartitionForListValue(parentTable, listValue string) (string, error) {
+	query := `
+		SELECT child.relname
+		FROM pg_class parent
+		JOIN pg_namespace n ON n.oid = parent.relnamespace
+		JOIN pg_inherits i ON i.inhparent = parent.oid
+		JOIN pg_class child ON child.oid = i.inhrelid
+		WHERE parent.relname = @parent_table
+		  AND n.nspname = 'public'
+		  AND pg_get_expr(child.relpartbound, child.oid) = 'FOR VALUES IN (' || quote_literal(@list_value) || ')'
+		LIMIT 1
+	`
+	var partitionName string
+	result := dbp.DB.Raw(query,
+		sql.Named("parent_table", parentTable),
+		sql.Named("list_value", listValue),
+	).Scan(&partitionName)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	return partitionName, nil
 }
 
 // createListMemberWithRangeSubPartitions creates a LIST partition member that is itself RANGE-partitioned

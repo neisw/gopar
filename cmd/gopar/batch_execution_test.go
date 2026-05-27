@@ -25,7 +25,7 @@ func Test_BatchExecutionLogic(t *testing.T) {
 // Test_LoadProwBackfillWithBatchSize verifies batch sizes are loaded from JSON
 func Test_LoadProwBackfillWithBatchSize(t *testing.T) {
 	var specs []SQLSpec
-	loadSpecsFromJSONForTest(t, "prow_job_runs_backfill.json", &specs)
+	loadSpecsFromJSONForTest(t, "001_prow_job_runs_backfill.json", &specs)
 
 	if len(specs) == 0 {
 		t.Fatal("Expected at least one spec")

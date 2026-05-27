@@ -118,13 +118,13 @@ Execute specs from a file using the `--spec-file` flag:
 
 ```bash
 # Execute all specs in the file
-gopar sql --dsn "..." --spec-file config/specs/prow_job_runs_backfill.json
+gopar sql --dsn "..." --spec-file config/specs/001_prow_job_runs_backfill.json
 
 # Execute specific specs from the file
-gopar sql --dsn "..." --spec-file config/specs/prow_job_runs_backfill.json --specs backfill_prow_job_runs
+gopar sql --dsn "..." --spec-file config/specs/001_prow_job_runs_backfill.json --specs backfill_prow_job_runs
 
 # Dry-run to preview
-gopar sql --dsn "..." --spec-file config/specs/prow_job_runs_backfill.json --dry-run
+gopar sql --dsn "..." --spec-file config/specs/001_prow_job_runs_backfill.json --dry-run
 ```
 
 ## Creating Custom Specs

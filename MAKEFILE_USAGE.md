@@ -192,7 +192,7 @@ make build
 # Execute specific specs
 ./build/gopar sql \
   --dsn "host=localhost user=postgres..." \
-  --spec-file config/specs/prow_job_runs_backfill.json \
+  --spec-file config/specs/001_prow_job_runs_backfill.json \
   --specs backfill_prow_job_runs \
   --dry-run
 ```
@@ -206,7 +206,7 @@ make build
 # Execute batch backfill (with real DSN, no dry-run)
 ./build/gopar sql \
   --dsn "host=prod-db user=app password=secret dbname=production" \
-  --spec-file config/specs/prow_job_runs_backfill.json \
+  --spec-file config/specs/001_prow_job_runs_backfill.json \
   --log-level info
 
 # Output will show batch progress:

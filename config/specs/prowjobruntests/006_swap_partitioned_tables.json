@@ -1,0 +1,8 @@
+[
+  {
+    "name": "swap_prow_job_run_tests",
+    "description": "Atomic table swap: drop FKs referencing prow_job_run_tests, rename old sequence and table to _old, rename new sequence and table to production names",
+    "concurrent": false,
+    "query": "BEGIN; ALTER TABLE prow_job_run_tests DROP CONSTRAINT IF EXISTS fk_prow_job_run_tests_prow_job_run_id; ALTER TABLE prow_job_run_test_outputs DROP CONSTRAINT IF EXISTS fk_prow_job_run_test_outputs_prow_job_run_test_id; ALTER SEQUENCE prow_job_run_tests_id_seq RENAME TO prow_job_run_tests_old_id_seq; ALTER TABLE prow_job_run_tests RENAME TO prow_job_run_tests_old; ALTER SEQUENCE prow_job_run_tests_new_id_seq RENAME TO prow_job_run_tests_id_seq; ALTER TABLE prow_job_run_tests_new RENAME TO prow_job_run_tests; COMMIT"
+  }
+]

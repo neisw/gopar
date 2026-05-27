@@ -1,0 +1,26 @@
+[
+  {
+    "name": "sync_prow_job_runs_new_id_seq",
+    "description": "Sync prow_job_runs_new identity sequence to max(id) after data migration",
+    "concurrent": true,
+    "query": "SELECT setval('prow_job_runs_new_id_seq', (SELECT COALESCE(MAX(id), 1) FROM prow_job_runs_new), true)"
+  },
+  {
+    "name": "sync_prow_job_run_annotations_new_id_seq",
+    "description": "Sync prow_job_run_annotations_new identity sequence to max(id) after data migration",
+    "concurrent": true,
+    "query": "SELECT setval('prow_job_run_annotations_new_id_seq', (SELECT COALESCE(MAX(id), 1) FROM prow_job_run_annotations_new), true)"
+  },
+  {
+    "name": "sync_prow_job_run_tests_new_id_seq",
+    "description": "Sync prow_job_run_tests_new identity sequence to max(id) after data migration",
+    "concurrent": true,
+    "query": "SELECT setval('prow_job_run_tests_new_id_seq', (SELECT COALESCE(MAX(id), 1) FROM prow_job_run_tests_new), true)"
+  },
+  {
+    "name": "sync_prow_job_run_test_outputs_new_id_seq",
+    "description": "Sync prow_job_run_test_outputs_new identity sequence to max(id) after data migration",
+    "concurrent": true,
+    "query": "SELECT setval('prow_job_run_test_outputs_new_id_seq', (SELECT COALESCE(MAX(id), 1) FROM prow_job_run_test_outputs_new), true)"
+  }
+]
