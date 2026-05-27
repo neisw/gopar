@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgconn"
 	"github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 )
@@ -454,8 +456,8 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 					// partition for this list value already exists under a
 					// different name — e.g. after a table rename where a
 					// hash-shortened name no longer matches the computed name.
-					var pqErr *pq.Error
-					if errors.As(err, &pqErr) && pqErr.Code == "42P17" {
+					var pgErr *pgconn.PgError
+					if errors.As(err, &pgErr) && pgErr.Code == "42P17" {
 						existingName, findErr := dbp.findPartitionForListValue(tableName, release)
 						if findErr == nil && existingName != "" {
 							l.WithFields(log.Fields{
@@ -718,4 +720,187 @@ func (dbp *DB_PARTITIONS) GetDailyPartitionsForRelease(
 	}
 
 	return results, nil
+}
+
+var partitionBoundsFromRe = regexp.MustCompile(`FROM \('(\d{4}-\d{2}-\d{2})`)
+
+// extractDateFromPartitionBounds parses the FROM date from a RANGE partition
+// bounds expression like "FOR VALUES FROM ('2026-04-29') TO ('2026-04-30')".
+func extractDateFromPartitionBounds(bounds string) *time.Time {
+	m := partitionBoundsFromRe.FindStringSubmatch(bounds)
+	if len(m) < 2 {
+		return nil
+	}
+	t, err := time.Parse("2006-01-02", m[1])
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+// RenamePartitionsToMatchConfig renames all partitions of tableName so that
+// their names match what buildNestedPartitionPrefix would produce for the
+// current table name and configuration. This is useful after a table swap
+// where partitions created under the old name (possibly hash-shortened)
+// no longer match the expected naming for the renamed table.
+func (dbp *DB_PARTITIONS) RenamePartitionsToMatchConfig(
+	tableName string,
+	releases []string,
+	usePartmanFormat bool,
+	dryRun bool,
+) (int, error) {
+	renamedCount := 0
+
+	l := log.WithFields(log.Fields{
+		"table":   tableName,
+		"dry_run": dryRun,
+	})
+
+	l.Info("reconciling partition names with current table configuration")
+
+	for _, release := range releases {
+		expectedIntermediate := buildNestedPartitionPrefix(tableName, release, usePartmanFormat)
+
+		actualIntermediate, err := dbp.findPartitionForListValue(tableName, release)
+		if err != nil {
+			return renamedCount, fmt.Errorf("failed to find partition for release %s: %w", release, err)
+		}
+		if actualIntermediate == "" {
+			l.WithField("release", release).Debug("no partition exists for release, skipping")
+			continue
+		}
+
+		// Rename the intermediate partition if needed
+		if actualIntermediate != expectedIntermediate {
+			if err := validatePartitionNameLength(expectedIntermediate); err != nil {
+				return renamedCount, fmt.Errorf("cannot rename %s: target name too long: %w", actualIntermediate, err)
+			}
+
+			exists, err := dbp.partitionExists(expectedIntermediate)
+			if err != nil {
+				return renamedCount, fmt.Errorf("failed to check if %s exists: %w", expectedIntermediate, err)
+			}
+			if exists {
+				return renamedCount, fmt.Errorf("cannot rename %s to %s: target already exists", actualIntermediate, expectedIntermediate)
+			}
+
+			if dryRun {
+				l.WithFields(log.Fields{
+					"from":    actualIntermediate,
+					"to":      expectedIntermediate,
+					"release": release,
+				}).Info("[DRY RUN] would rename intermediate partition")
+			} else {
+				renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
+					pq.QuoteIdentifier(actualIntermediate),
+					pq.QuoteIdentifier(expectedIntermediate),
+				)
+				if result := dbp.DB.Exec(renameSQL); result.Error != nil {
+					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", actualIntermediate, expectedIntermediate, result.Error)
+				}
+				l.WithFields(log.Fields{
+					"from":    actualIntermediate,
+					"to":      expectedIntermediate,
+					"release": release,
+				}).Info("renamed intermediate partition")
+			}
+			renamedCount++
+		}
+
+		// Find daily child partitions under the intermediate (use the name
+		// that currently exists in the catalog — the renamed one if we just
+		// renamed it, otherwise the original).
+		currentIntermediate := expectedIntermediate
+		if dryRun && actualIntermediate != expectedIntermediate {
+			currentIntermediate = actualIntermediate
+		}
+
+		children, err := dbp.getChildPartitions(currentIntermediate)
+		if err != nil {
+			return renamedCount, fmt.Errorf("failed to list children of %s: %w", currentIntermediate, err)
+		}
+
+		for _, child := range children {
+			date := extractDateFromPartitionBounds(child.bounds)
+			if date == nil {
+				date = extractDateFromPartitionName(child.name)
+			}
+			if date == nil {
+				l.WithField("partition", child.name).Warn("could not extract date from partition, skipping")
+				continue
+			}
+
+			var expectedDaily string
+			if usePartmanFormat {
+				expectedDaily = fmt.Sprintf("%s_p%s", expectedIntermediate, date.Format("2006_01_02"))
+			} else {
+				expectedDaily = fmt.Sprintf("%s_%s", expectedIntermediate, date.Format("2006_01_02"))
+			}
+
+			if child.name == expectedDaily {
+				continue
+			}
+
+			if err := validatePartitionNameLength(expectedDaily); err != nil {
+				return renamedCount, fmt.Errorf("cannot rename %s: target name too long: %w", child.name, err)
+			}
+
+			if dryRun {
+				l.WithFields(log.Fields{
+					"from": child.name,
+					"to":   expectedDaily,
+				}).Info("[DRY RUN] would rename daily partition")
+			} else {
+				renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
+					pq.QuoteIdentifier(child.name),
+					pq.QuoteIdentifier(expectedDaily),
+				)
+				if result := dbp.DB.Exec(renameSQL); result.Error != nil {
+					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", child.name, expectedDaily, result.Error)
+				}
+				l.WithFields(log.Fields{
+					"from": child.name,
+					"to":   expectedDaily,
+				}).Debug("renamed daily partition")
+			}
+			renamedCount++
+		}
+	}
+
+	l.WithField("total_renamed", renamedCount).Info("partition name reconciliation complete")
+	return renamedCount, nil
+}
+
+type childPartition struct {
+	name   string
+	bounds string
+}
+
+// getChildPartitions returns the immediate child partitions of a table.
+func (dbp *DB_PARTITIONS) getChildPartitions(parentName string) ([]childPartition, error) {
+	query := `
+		SELECT child.relname AS name,
+		       pg_get_expr(child.relpartbound, child.oid) AS bounds
+		FROM pg_class parent
+		JOIN pg_namespace n ON n.oid = parent.relnamespace
+		JOIN pg_inherits i ON i.inhparent = parent.oid
+		JOIN pg_class child ON child.oid = i.inhrelid
+		WHERE parent.relname = @parent_name AND n.nspname = 'public'
+		ORDER BY child.relname
+	`
+
+	var rows []struct {
+		Name   string
+		Bounds string
+	}
+	result := dbp.DB.Raw(query, sql.Named("parent_name", parentName)).Scan(&rows)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	children := make([]childPartition, len(rows))
+	for i, r := range rows {
+		children[i] = childPartition{name: r.Name, bounds: r.Bounds}
+	}
+	return children, nil
 }

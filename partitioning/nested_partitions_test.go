@@ -181,6 +181,58 @@ func Test_buildNestedPartitionPrefix(t *testing.T) {
 	}
 }
 
+func Test_extractDateFromPartitionBounds(t *testing.T) {
+	tests := []struct {
+		name   string
+		bounds string
+		want   string // expected date string or "" if nil
+	}{
+		{
+			name:   "standard range bounds",
+			bounds: "FOR VALUES FROM ('2026-04-29') TO ('2026-04-30')",
+			want:   "2026-04-29",
+		},
+		{
+			name:   "different date",
+			bounds: "FOR VALUES FROM ('2024-01-01') TO ('2024-01-02')",
+			want:   "2024-01-01",
+		},
+		{
+			name:   "list bounds (no FROM)",
+			bounds: "FOR VALUES IN ('aro_classic_production')",
+			want:   "",
+		},
+		{
+			name:   "empty string",
+			bounds: "",
+			want:   "",
+		},
+		{
+			name:   "malformed bounds",
+			bounds: "FOR VALUES FROM ('not-a-date') TO ('also-not')",
+			want:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractDateFromPartitionBounds(tt.bounds)
+			if tt.want == "" {
+				if got != nil {
+					t.Errorf("expected nil, got %v", got)
+				}
+			} else {
+				if got == nil {
+					t.Fatalf("expected %s, got nil", tt.want)
+				}
+				if got.Format("2006-01-02") != tt.want {
+					t.Errorf("expected %s, got %s", tt.want, got.Format("2006-01-02"))
+				}
+			}
+		})
+	}
+}
+
 func Test_nestedPartitionNameOverflow(t *testing.T) {
 	tests := []struct {
 		name             string
