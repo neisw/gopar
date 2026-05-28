@@ -8,9 +8,6 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // getTestDBClient returns a database client for testing.
@@ -23,28 +20,22 @@ func getTestDBClient(t *testing.T) *sql.DB {
 		t.Skip("skipping: set GOPAR_TEST_DSN environment variable to run")
 	}
 
-	// Connect to database
-	gormConfig := &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Info),
-	}
-
-	db, err := gorm.Open(postgres.Open(dsn), gormConfig)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatalf("Failed to get underlying sql.DB: %v", err)
+	if err := db.Ping(); err != nil {
+		t.Fatalf("Failed to ping database: %v", err)
 	}
 
 	t.Cleanup(func() {
-		if err := sqlDB.Close(); err != nil {
+		if err := db.Close(); err != nil {
 			t.Logf("failed to close database connection: %v", err)
 		}
 	})
 
-	return sqlDB
+	return db
 }
 
 // loadSpecsFromJSONForTest loads specifications from a JSON file for testing

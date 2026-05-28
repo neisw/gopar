@@ -1,17 +1,17 @@
 package partitioning
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"gorm.io/gorm"
 )
 
 // ExampleListPartitionedTables connects to the database and prints every
 // partitioned table along with its strategy and current partition count.
-func ExampleListPartitionedTables(db *gorm.DB) error {
-	dbp := &DB_PARTITIONS{DB: db}
+func ExampleListPartitionedTables(db *sql.DB) error {
+	dbp := NewPartitions(db)
 
 	tables, err := dbp.ListPartitionedTables()
 	if err != nil {
@@ -42,8 +42,8 @@ func ExampleListPartitionedTables(db *gorm.DB) error {
 //	    ├── events_v4_0_2024_01_01
 //	    ├── events_v4_0_2024_01_02
 //	    └── ...
-func ExampleAddRelease(db *gorm.DB, tableName, release, dateColumn string, start, end time.Time, dryRun bool) error {
-	dbp := &DB_PARTITIONS{DB: db}
+func ExampleAddRelease(db *sql.DB, tableName, release, dateColumn string, start, end time.Time, dryRun bool) error {
+	dbp := NewPartitions(db)
 
 	created, err := dbp.CreateMissingPartitionsListToRange(
 		tableName,
@@ -71,8 +71,8 @@ func ExampleAddRelease(db *gorm.DB, tableName, release, dateColumn string, start
 // ExampleDetachRelease detaches an entire release partition (the intermediate
 // LIST member and all of its daily children) from a nested partitioned table.
 // The detached tables remain on disk until explicitly dropped.
-func ExampleDetachRelease(db *gorm.DB, tableName, release string, dryRun bool) error {
-	dbp := &DB_PARTITIONS{DB: db}
+func ExampleDetachRelease(db *sql.DB, tableName, release string, dryRun bool) error {
+	dbp := NewPartitions(db)
 
 	safeName := sanitizePartitionName(release)
 	intermediatePartition := fmt.Sprintf("%s_%s", tableName, safeName)
@@ -103,8 +103,8 @@ func ExampleDetachRelease(db *gorm.DB, tableName, release string, dryRun bool) e
 
 // ExampleAddDailyPartitions creates daily RANGE partitions that are missing for
 // a single-level RANGE-partitioned table over the given date range.
-func ExampleAddDailyPartitions(db *gorm.DB, tableName string, start, end time.Time, dryRun bool) error {
-	dbp := &DB_PARTITIONS{DB: db}
+func ExampleAddDailyPartitions(db *sql.DB, tableName string, start, end time.Time, dryRun bool) error {
+	dbp := NewPartitions(db)
 
 	created, err := dbp.CreateMissingPartitions(tableName, start, end, false, dryRun)
 	if err != nil {
@@ -125,8 +125,8 @@ func ExampleAddDailyPartitions(db *gorm.DB, tableName string, start, end time.Ti
 // ExampleDetachOldDailyPartitions detaches daily partitions older than
 // retentionDays from a RANGE-partitioned table.  Detached partitions stay on
 // disk as standalone tables until they are explicitly dropped.
-func ExampleDetachOldDailyPartitions(db *gorm.DB, tableName string, retentionDays int, dryRun bool) error {
-	dbp := &DB_PARTITIONS{DB: db}
+func ExampleDetachOldDailyPartitions(db *sql.DB, tableName string, retentionDays int, dryRun bool) error {
+	dbp := NewPartitions(db)
 
 	detached, err := dbp.DetachOldPartitions(tableName, retentionDays, dryRun)
 	if err != nil {
@@ -147,8 +147,8 @@ func ExampleDetachOldDailyPartitions(db *gorm.DB, tableName string, retentionDay
 // are older than retentionDays.  This is destructive — data is deleted from
 // disk.  Call ExampleDetachOldDailyPartitions (or ExampleDetachRelease) first
 // so the partitions are detached before dropping.
-func ExampleDropDetachedPartitions(db *gorm.DB, tableName string, retentionDays int, dryRun bool) error {
-	dbp := &DB_PARTITIONS{DB: db}
+func ExampleDropDetachedPartitions(db *sql.DB, tableName string, retentionDays int, dryRun bool) error {
+	dbp := NewPartitions(db)
 
 	detached, err := dbp.ListDetachedPartitions(tableName)
 	if err != nil {
@@ -192,7 +192,7 @@ func ExampleDropDetachedPartitions(db *gorm.DB, tableName string, retentionDays 
 //  4. Add new daily partitions for an existing release
 //  5. Detach old daily partitions from a release
 //  6. Drop all detached partitions past the retention window
-func ExampleFullLifecycle(db *gorm.DB, tableName, dateColumn string, dryRun bool) error {
+func ExampleFullLifecycle(db *sql.DB, tableName, dateColumn string, dryRun bool) error {
 
 	// ── 1. List partitioned tables ──────────────────────────────────────
 	if err := ExampleListPartitionedTables(db); err != nil {

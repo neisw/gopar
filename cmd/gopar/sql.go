@@ -10,9 +10,6 @@ import (
 	_ "github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // SQLSpec defines a SQL statement to execute
@@ -103,20 +100,15 @@ func runSQL(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to database
-	gormConfig := &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Info),
-	}
-
-	db, err := gorm.Open(postgres.Open(dsn), gormConfig)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
+	defer db.Close()
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
 	}
-	defer sqlDB.Close()
 
 	// Execute specs
 	for _, spec := range specs {
@@ -124,7 +116,7 @@ func runSQL(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		if err := executeSpec(sqlDB, spec); err != nil {
+		if err := executeSpec(db, spec); err != nil {
 			return fmt.Errorf("failed to execute spec %s: %w", spec.Name, err)
 		}
 	}

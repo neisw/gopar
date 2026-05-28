@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgconn"
 	"github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 )
@@ -96,7 +95,6 @@ func buildNestedPartitionPrefix(tableName, release string, usePartmanFormat bool
 func (dbp *DB_PARTITIONS) GetPartitionHierarchy(tableName string) ([]PartitionHierarchyInfo, error) {
 	start := time.Now()
 
-	// Recursive query to get full hierarchy
 	query := `
 		WITH RECURSIVE partition_tree AS (
 			-- Base case: root partitioned table
@@ -117,7 +115,7 @@ func (dbp *DB_PARTITIONS) GetPartitionHierarchy(tableName string) ([]PartitionHi
 			FROM pg_class c
 			JOIN pg_namespace n ON n.oid = c.relnamespace
 			LEFT JOIN pg_partitioned_table pp ON pp.partrelid = c.oid
-			WHERE c.relname = @table_name AND n.nspname = 'public'
+			WHERE c.relname = $1 AND n.nspname = 'public'
 
 			UNION ALL
 
@@ -158,22 +156,33 @@ func (dbp *DB_PARTITIONS) GetPartitionHierarchy(tableName string) ([]PartitionHi
 		ORDER BY pt.level, pt.table_name
 	`
 
-	var results []struct {
-		TableName       string
-		ParentName      sql.NullString
-		Level           int
-		Strategy        sql.NullString
-		PartitionKey    string
-		PartitionBounds string
-		IsPartitioned   bool
-		SizeBytes       int64
-		SizePretty      string
-		RowEstimate     int64
+	rows, err := dbp.db.Query(query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query partition hierarchy: %w", err)
 	}
 
-	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&results)
-	if result.Error != nil {
-		return nil, fmt.Errorf("failed to query partition hierarchy: %w", result.Error)
+	type hierarchyRow struct {
+		tableName       string
+		parentName      sql.NullString
+		level           int
+		strategy        sql.NullString
+		partitionKey    string
+		partitionBounds string
+		isPartitioned   bool
+		sizeBytes       int64
+		sizePretty      string
+		rowEstimate     int64
+	}
+
+	results, err := scanRows(rows, func(r *sql.Rows) (hierarchyRow, error) {
+		var h hierarchyRow
+		err := r.Scan(&h.tableName, &h.parentName, &h.level, &h.strategy,
+			&h.partitionKey, &h.partitionBounds, &h.isPartitioned,
+			&h.sizeBytes, &h.sizePretty, &h.rowEstimate)
+		return h, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query partition hierarchy: %w", err)
 	}
 
 	if len(results) == 0 {
@@ -184,27 +193,26 @@ func (dbp *DB_PARTITIONS) GetPartitionHierarchy(tableName string) ([]PartitionHi
 	var hierarchy []PartitionHierarchyInfo
 	for _, r := range results {
 		info := PartitionHierarchyInfo{
-			TableName:       r.TableName,
-			Level:           PartitionLevel(r.Level),
-			IsPartitioned:   r.IsPartitioned,
-			IsLeaf:          !r.IsPartitioned && r.Level > 0, // Leaf if not partitioned and not root
-			PartitionKey:    r.PartitionKey,
-			PartitionBounds: r.PartitionBounds,
-			SizeBytes:       r.SizeBytes,
-			SizePretty:      r.SizePretty,
-			RowEstimate:     r.RowEstimate,
+			TableName:       r.tableName,
+			Level:           PartitionLevel(r.level),
+			IsPartitioned:   r.isPartitioned,
+			IsLeaf:          !r.isPartitioned && r.level > 0,
+			PartitionKey:    r.partitionKey,
+			PartitionBounds: r.partitionBounds,
+			SizeBytes:       r.sizeBytes,
+			SizePretty:      r.sizePretty,
+			RowEstimate:     r.rowEstimate,
 		}
 
-		if r.ParentName.Valid {
-			info.ParentTable = r.ParentName.String
+		if r.parentName.Valid {
+			info.ParentTable = r.parentName.String
 		}
 
-		if r.Strategy.Valid {
-			info.Strategy = r.Strategy.String
+		if r.strategy.Valid {
+			info.Strategy = r.strategy.String
 		}
 
-		// Try to extract date from partition name if it follows naming convention
-		if date := extractDateFromPartitionName(r.TableName); date != nil {
+		if date := extractDateFromPartitionName(r.tableName); date != nil {
 			info.PartitionDate = date
 		}
 
@@ -235,7 +243,7 @@ func (dbp *DB_PARTITIONS) ListLeafPartitions(tableName string) ([]PartitionHiera
 				NULL::name AS parent_name
 			FROM pg_class c
 			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE c.relname = @table_name AND n.nspname = 'public'
+			WHERE c.relname = $1 AND n.nspname = 'public'
 
 			UNION ALL
 
@@ -268,43 +276,53 @@ func (dbp *DB_PARTITIONS) ListLeafPartitions(tableName string) ([]PartitionHiera
 		ORDER BY pt.level, pt.table_name
 	`
 
-	var results []struct {
-		TableName       string
-		ParentName      sql.NullString
-		Level           int
-		SizeBytes       int64
-		SizePretty      string
-		RowEstimate     int64
-		PartitionBounds sql.NullString
+	rows, err := dbp.db.Query(query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query leaf partitions: %w", err)
 	}
 
-	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&results)
-	if result.Error != nil {
-		return nil, fmt.Errorf("failed to query leaf partitions: %w", result.Error)
+	type leafRow struct {
+		tableName       string
+		parentName      sql.NullString
+		level           int
+		sizeBytes       int64
+		sizePretty      string
+		rowEstimate     int64
+		partitionBounds sql.NullString
+	}
+
+	results, err := scanRows(rows, func(r *sql.Rows) (leafRow, error) {
+		var l leafRow
+		err := r.Scan(&l.tableName, &l.parentName, &l.level,
+			&l.sizeBytes, &l.sizePretty, &l.rowEstimate, &l.partitionBounds)
+		return l, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query leaf partitions: %w", err)
 	}
 
 	// Convert to PartitionHierarchyInfo
 	var leaves []PartitionHierarchyInfo
 	for _, r := range results {
 		info := PartitionHierarchyInfo{
-			TableName:     r.TableName,
-			Level:         PartitionLevel(r.Level),
+			TableName:     r.tableName,
+			Level:         PartitionLevel(r.level),
 			IsLeaf:        true,
 			IsPartitioned: false,
-			SizeBytes:     r.SizeBytes,
-			SizePretty:    r.SizePretty,
-			RowEstimate:   r.RowEstimate,
+			SizeBytes:     r.sizeBytes,
+			SizePretty:    r.sizePretty,
+			RowEstimate:   r.rowEstimate,
 		}
 
-		if r.ParentName.Valid {
-			info.ParentTable = r.ParentName.String
+		if r.parentName.Valid {
+			info.ParentTable = r.parentName.String
 		}
 
-		if r.PartitionBounds.Valid {
-			info.PartitionBounds = r.PartitionBounds.String
+		if r.partitionBounds.Valid {
+			info.PartitionBounds = r.partitionBounds.String
 		}
 
-		if date := extractDateFromPartitionName(r.TableName); date != nil {
+		if date := extractDateFromPartitionName(r.tableName); date != nil {
 			info.PartitionDate = date
 		}
 
@@ -331,7 +349,7 @@ func (dbp *DB_PARTITIONS) GetPartitionLevel(partitionName string) (int, error) {
 				0 AS level
 			FROM pg_class c
 			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE c.relname = @partition_name AND n.nspname = 'public'
+			WHERE c.relname = $1 AND n.nspname = 'public'
 
 			UNION ALL
 
@@ -347,9 +365,9 @@ func (dbp *DB_PARTITIONS) GetPartitionLevel(partitionName string) (int, error) {
 	`
 
 	var level int
-	result := dbp.DB.Raw(query, sql.Named("partition_name", partitionName)).Scan(&level)
-	if result.Error != nil {
-		return 0, fmt.Errorf("failed to get partition level: %w", result.Error)
+	err := dbp.db.QueryRow(query, partitionName).Scan(&level)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get partition level: %w", err)
 	}
 
 	return level, nil
@@ -389,19 +407,19 @@ func (dbp *DB_PARTITIONS) partitionExists(partitionName string) (bool, error) {
 		SELECT EXISTS (
 			SELECT 1 FROM pg_class c
 			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE c.relname = @partition_name AND n.nspname = 'public'
+			WHERE c.relname = $1 AND n.nspname = 'public'
 		)
 	`
 
-	result := dbp.DB.Raw(query, sql.Named("partition_name", partitionName)).Scan(&exists)
-	return exists, result.Error
+	err := dbp.db.QueryRow(query, partitionName).Scan(&exists)
+	return exists, err
 }
 
 // CreateMissingPartitionsListToRange creates LIST → RANGE nested partitions
 // For each release value, creates an intermediate partition that is RANGE-partitioned by date
 func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 	tableName string,
-	releases []string, // List of release names (e.g., ["v1.0", "v2.0", "v3.0"])
+	releases []string,
 	startDate, endDate time.Time,
 	dateColumn string,
 	usePartmanFormat bool,
@@ -456,8 +474,8 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 					// partition for this list value already exists under a
 					// different name — e.g. after a table rename where a
 					// hash-shortened name no longer matches the computed name.
-					var pgErr *pgconn.PgError
-					if errors.As(err, &pgErr) && pgErr.Code == "42P17" {
+					var pqErr *pq.Error
+					if errors.As(err, &pqErr) && string(pqErr.Code) == "42P17" {
 						existingName, findErr := dbp.findPartitionForListValue(tableName, release)
 						if findErr == nil && existingName != "" {
 							l.WithFields(log.Fields{
@@ -512,18 +530,18 @@ func (dbp *DB_PARTITIONS) findPartitionForListValue(parentTable, listValue strin
 		JOIN pg_namespace n ON n.oid = parent.relnamespace
 		JOIN pg_inherits i ON i.inhparent = parent.oid
 		JOIN pg_class child ON child.oid = i.inhrelid
-		WHERE parent.relname = @parent_table
+		WHERE parent.relname = $1
 		  AND n.nspname = 'public'
-		  AND pg_get_expr(child.relpartbound, child.oid) = 'FOR VALUES IN (' || quote_literal(@list_value) || ')'
+		  AND pg_get_expr(child.relpartbound, child.oid) = 'FOR VALUES IN (' || quote_literal($2) || ')'
 		LIMIT 1
 	`
 	var partitionName string
-	result := dbp.DB.Raw(query,
-		sql.Named("parent_table", parentTable),
-		sql.Named("list_value", listValue),
-	).Scan(&partitionName)
-	if result.Error != nil {
-		return "", result.Error
+	err := dbp.db.QueryRow(query, parentTable, listValue).Scan(&partitionName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
 	}
 	return partitionName, nil
 }
@@ -535,12 +553,7 @@ func (dbp *DB_PARTITIONS) createListMemberWithRangeSubPartitions(
 	listValue string,
 	rangeColumn string,
 ) error {
-	// SQL example:
-	// CREATE TABLE events_v1_0 PARTITION OF events
-	//   FOR VALUES IN ('v1.0')
-	//   PARTITION BY RANGE (event_date);
-
-	sql := fmt.Sprintf(
+	query := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES IN (%s) PARTITION BY RANGE (%s)",
 		pq.QuoteIdentifier(partitionName),
 		pq.QuoteIdentifier(parentTable),
@@ -549,14 +562,13 @@ func (dbp *DB_PARTITIONS) createListMemberWithRangeSubPartitions(
 	)
 
 	log.WithFields(log.Fields{
-		"sql":       sql,
+		"sql":       query,
 		"partition": partitionName,
 		"value":     listValue,
 	}).Debug("creating LIST member with RANGE sub-partitioning")
 
-	result := dbp.DB.Exec(sql)
-	if result.Error != nil {
-		return fmt.Errorf("failed to execute CREATE TABLE: %w", result.Error)
+	if _, err := dbp.db.Exec(query); err != nil {
+		return fmt.Errorf("failed to execute CREATE TABLE: %w", err)
 	}
 
 	return nil
@@ -600,11 +612,7 @@ func (dbp *DB_PARTITIONS) createDailyPartitionsUnder(
 			if dryRun {
 				log.WithField("partition", dailyPartition).Info("[DRY RUN] would create daily partition")
 			} else {
-				// Create daily partition
-				// CREATE TABLE events_v1_0_2024_01_01 PARTITION OF events_v1_0
-				//   FOR VALUES FROM ('2024-01-01') TO ('2024-01-02');
-
-				sql := fmt.Sprintf(
+				query := fmt.Sprintf(
 					"CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)",
 					pq.QuoteIdentifier(dailyPartition),
 					pq.QuoteIdentifier(intermediatePartition),
@@ -612,9 +620,8 @@ func (dbp *DB_PARTITIONS) createDailyPartitionsUnder(
 					pq.QuoteLiteral(nextDate.Format("2006-01-02")),
 				)
 
-				result := dbp.DB.Exec(sql)
-				if result.Error != nil {
-					return createdCount, fmt.Errorf("failed to create daily partition %s: %w", dailyPartition, result.Error)
+				if _, err := dbp.db.Exec(query); err != nil {
+					return createdCount, fmt.Errorf("failed to create daily partition %s: %w", dailyPartition, err)
 				}
 
 				log.WithField("partition", dailyPartition).Debug("created daily partition")
@@ -674,42 +681,50 @@ func (dbp *DB_PARTITIONS) GetDailyPartitionsForRelease(
 		JOIN pg_inherits i ON i.inhparent = parent.oid
 		JOIN pg_class child ON child.oid = i.inhrelid
 		LEFT JOIN pg_stat_user_tables s ON s.relname = child.relname AND s.schemaname = 'public'
-		WHERE parent.relname = @intermediate_partition
+		WHERE parent.relname = $1
 		ORDER BY child.relname
 	`
 
-	var partitions []struct {
-		TableName       string
-		ParentName      string
-		Level           int
-		PartitionBounds string
-		SizeBytes       int64
-		SizePretty      string
-		RowEstimate     int64
+	rows, err := dbp.db.Query(query, intermediatePartition)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get daily partitions for release %s: %w", release, err)
 	}
 
-	result := dbp.DB.Raw(query, sql.Named("intermediate_partition", intermediatePartition)).Scan(&partitions)
+	type dailyRow struct {
+		tableName       string
+		parentName      string
+		level           int
+		partitionBounds string
+		sizeBytes       int64
+		sizePretty      string
+		rowEstimate     int64
+	}
 
-	if result.Error != nil {
-		return nil, fmt.Errorf("failed to get daily partitions for release %s: %w", release, result.Error)
+	scanned, err := scanRows(rows, func(r *sql.Rows) (dailyRow, error) {
+		var d dailyRow
+		err := r.Scan(&d.tableName, &d.parentName, &d.level,
+			&d.partitionBounds, &d.sizeBytes, &d.sizePretty, &d.rowEstimate)
+		return d, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get daily partitions for release %s: %w", release, err)
 	}
 
 	// Convert to PartitionHierarchyInfo
 	var results []PartitionHierarchyInfo
-	for _, p := range partitions {
-		// Extract date from partition name (events_v1_0_2024_01_01)
-		datePart := extractDateFromPartitionName(p.TableName)
+	for _, p := range scanned {
+		datePart := extractDateFromPartitionName(p.tableName)
 
 		info := PartitionHierarchyInfo{
-			TableName:       p.TableName,
-			ParentTable:     p.ParentName,
-			Level:           PartitionLevel(p.Level),
+			TableName:       p.tableName,
+			ParentTable:     p.parentName,
+			Level:           PartitionLevel(p.level),
 			IsLeaf:          true,
 			IsPartitioned:   false,
-			PartitionBounds: p.PartitionBounds,
-			SizeBytes:       p.SizeBytes,
-			SizePretty:      p.SizePretty,
-			RowEstimate:     p.RowEstimate,
+			PartitionBounds: p.partitionBounds,
+			SizeBytes:       p.sizeBytes,
+			SizePretty:      p.sizePretty,
+			RowEstimate:     p.rowEstimate,
 		}
 
 		if datePart != nil {
@@ -795,8 +810,8 @@ func (dbp *DB_PARTITIONS) RenamePartitionsToMatchConfig(
 					pq.QuoteIdentifier(actualIntermediate),
 					pq.QuoteIdentifier(expectedIntermediate),
 				)
-				if result := dbp.DB.Exec(renameSQL); result.Error != nil {
-					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", actualIntermediate, expectedIntermediate, result.Error)
+				if _, err := dbp.db.Exec(renameSQL); err != nil {
+					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", actualIntermediate, expectedIntermediate, err)
 				}
 				l.WithFields(log.Fields{
 					"from":    actualIntermediate,
@@ -855,8 +870,8 @@ func (dbp *DB_PARTITIONS) RenamePartitionsToMatchConfig(
 					pq.QuoteIdentifier(child.name),
 					pq.QuoteIdentifier(expectedDaily),
 				)
-				if result := dbp.DB.Exec(renameSQL); result.Error != nil {
-					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", child.name, expectedDaily, result.Error)
+				if _, err := dbp.db.Exec(renameSQL); err != nil {
+					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", child.name, expectedDaily, err)
 				}
 				l.WithFields(log.Fields{
 					"from": child.name,
@@ -885,22 +900,17 @@ func (dbp *DB_PARTITIONS) getChildPartitions(parentName string) ([]childPartitio
 		JOIN pg_namespace n ON n.oid = parent.relnamespace
 		JOIN pg_inherits i ON i.inhparent = parent.oid
 		JOIN pg_class child ON child.oid = i.inhrelid
-		WHERE parent.relname = @parent_name AND n.nspname = 'public'
+		WHERE parent.relname = $1 AND n.nspname = 'public'
 		ORDER BY child.relname
 	`
 
-	var rows []struct {
-		Name   string
-		Bounds string
+	rows, err := dbp.db.Query(query, parentName)
+	if err != nil {
+		return nil, err
 	}
-	result := dbp.DB.Raw(query, sql.Named("parent_name", parentName)).Scan(&rows)
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	children := make([]childPartition, len(rows))
-	for i, r := range rows {
-		children[i] = childPartition{name: r.Name, bounds: r.Bounds}
-	}
-	return children, nil
+	return scanRows(rows, func(r *sql.Rows) (childPartition, error) {
+		var c childPartition
+		err := r.Scan(&c.name, &c.bounds)
+		return c, err
+	})
 }

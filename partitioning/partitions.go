@@ -2,18 +2,57 @@ package partitioning
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
-	"gorm.io/gorm"
 )
+
+type queryable interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
 
 // DB_PARTITIONS provides partition management functionality for PostgreSQL tables
 type DB_PARTITIONS struct {
-	DB *gorm.DB
+	db queryable
+}
+
+func NewPartitions(db *sql.DB) *DB_PARTITIONS {
+	return &DB_PARTITIONS{db: db}
+}
+
+func (dbp *DB_PARTITIONS) withTx(fn func(*DB_PARTITIONS) error) error {
+	sqlDB, ok := dbp.db.(*sql.DB)
+	if !ok {
+		return fmt.Errorf("cannot begin transaction: already in a transaction")
+	}
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(&DB_PARTITIONS{db: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func scanRows[T any](rows *sql.Rows, scan func(*sql.Rows) (T, error)) ([]T, error) {
+	defer rows.Close()
+	var results []T
+	for rows.Next() {
+		item, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
 }
 
 // PartitionStrategy defines the partitioning strategy type
@@ -38,21 +77,27 @@ func escapeForLike(s string) string {
 
 // PartitionInfo holds metadata about a partition
 type PartitionInfo struct {
-	TableName     string    `gorm:"column:tablename"`
-	SchemaName    string    `gorm:"column:schemaname"`
-	PartitionDate time.Time `gorm:"column:partition_date"`
-	Age           int       `gorm:"column:age_days"`
-	SizeBytes     int64     `gorm:"column:size_bytes"`
-	SizePretty    string    `gorm:"column:size_pretty"`
-	RowEstimate   int64     `gorm:"column:row_estimate"`
+	TableName     string
+	SchemaName    string
+	PartitionDate time.Time
+	Age           int
+	SizeBytes     int64
+	SizePretty    string
+	RowEstimate   int64
+}
+
+func scanPartitionInfo(rows *sql.Rows) (PartitionInfo, error) {
+	var p PartitionInfo
+	err := rows.Scan(&p.TableName, &p.SchemaName, &p.PartitionDate, &p.Age, &p.SizeBytes, &p.SizePretty, &p.RowEstimate)
+	return p, err
 }
 
 // PartitionedTableInfo holds metadata about a partitioned parent table
 type PartitionedTableInfo struct {
-	TableName         string `gorm:"column:tablename"`
-	SchemaName        string `gorm:"column:schemaname"`
-	PartitionCount    int    `gorm:"column:partition_count"`
-	PartitionStrategy string `gorm:"column:partition_strategy"`
+	TableName         string
+	SchemaName        string
+	PartitionCount    int
+	PartitionStrategy string
 }
 
 // PartitionStats holds aggregate statistics about partitions
@@ -64,6 +109,13 @@ type PartitionStats struct {
 	NewestDate      sql.NullTime
 	AvgSizeBytes    int64
 	AvgSizePretty   string
+}
+
+func scanPartitionStats(row *sql.Row) (PartitionStats, error) {
+	var s PartitionStats
+	err := row.Scan(&s.TotalPartitions, &s.TotalSizeBytes, &s.TotalSizePretty,
+		&s.OldestDate, &s.NewestDate, &s.AvgSizeBytes, &s.AvgSizePretty)
+	return s, err
 }
 
 // RetentionSummary provides a summary of what would be affected by a retention policy
@@ -223,7 +275,6 @@ func (pc PartitionConfig) ToSQL() string {
 // ListPartitionedTables returns all partitioned parent tables in the database
 func (dbp *DB_PARTITIONS) ListPartitionedTables() ([]PartitionedTableInfo, error) {
 	start := time.Now()
-	var tables []PartitionedTableInfo
 
 	query := `
 		SELECT
@@ -245,10 +296,19 @@ func (dbp *DB_PARTITIONS) ListPartitionedTables() ([]PartitionedTableInfo, error
 		ORDER BY c.relname
 	`
 
-	result := dbp.DB.Raw(query).Scan(&tables)
-	if result.Error != nil {
-		log.WithError(result.Error).Error("failed to list partitioned tables")
-		return nil, result.Error
+	rows, err := dbp.db.Query(query)
+	if err != nil {
+		log.WithError(err).Error("failed to list partitioned tables")
+		return nil, err
+	}
+	tables, err := scanRows(rows, func(r *sql.Rows) (PartitionedTableInfo, error) {
+		var t PartitionedTableInfo
+		err := r.Scan(&t.TableName, &t.SchemaName, &t.PartitionCount, &t.PartitionStrategy)
+		return t, err
+	})
+	if err != nil {
+		log.WithError(err).Error("failed to list partitioned tables")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -263,7 +323,6 @@ func (dbp *DB_PARTITIONS) ListPartitionedTables() ([]PartitionedTableInfo, error
 // ListTablePartitions returns all partitions for a given table
 func (dbp *DB_PARTITIONS) ListTablePartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
-	var partitions []PartitionInfo
 
 	// Detect partition format
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
@@ -289,14 +348,19 @@ func (dbp *DB_PARTITIONS) ListTablePartitions(tableName string) ([]PartitionInfo
 		LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relname = pg_tables.tablename
 			AND pg_stat_user_tables.schemaname = pg_tables.schemaname
 		WHERE pg_tables.schemaname = 'public'
-			AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
+			AND pg_tables.tablename LIKE $1 ESCAPE '\'
 		ORDER BY partition_date ASC
 	`, sqlPattern, sqlPattern)
 
-	result := dbp.DB.Raw(query, sql.Named("table_pattern", tablePattern)).Scan(&partitions)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to list table partitions")
-		return nil, result.Error
+	rows, err := dbp.db.Query(query, tablePattern)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to list table partitions")
+		return nil, err
+	}
+	partitions, err := scanRows(rows, scanPartitionInfo)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to list table partitions")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -312,7 +376,6 @@ func (dbp *DB_PARTITIONS) ListTablePartitions(tableName string) ([]PartitionInfo
 // GetPartitionStats returns aggregate statistics about partitions for a given table
 func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
-	var stats PartitionStats
 
 	// Detect partition format
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
@@ -333,7 +396,7 @@ func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, 
 				pg_total_relation_size('public.'||tablename) AS size_bytes
 			FROM pg_tables
 			WHERE schemaname = 'public'
-				AND tablename LIKE @table_pattern ESCAPE '\'
+				AND tablename LIKE $1 ESCAPE '\'
 		)
 		SELECT
 			COUNT(*)::INT AS total_partitions,
@@ -346,10 +409,10 @@ func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, 
 		FROM partition_info
 	`, sqlPattern)
 
-	result := dbp.DB.Raw(query, sql.Named("table_pattern", tablePattern)).Scan(&stats)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to get partition statistics")
-		return nil, result.Error
+	stats, err := scanPartitionStats(dbp.db.QueryRow(query, tablePattern))
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to get partition statistics")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -369,7 +432,6 @@ func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, 
 // If attachedOnly is false, returns all partitions (useful for drop operations on both attached and detached)
 func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDays int, attachedOnly bool) ([]PartitionInfo, error) {
 	start := time.Now()
-	var partitions []PartitionInfo
 
 	cutoffDate := time.Now().AddDate(0, 0, -retentionDays)
 
@@ -385,6 +447,7 @@ func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDay
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
 	var query string
+	var args []any
 	if attachedOnly {
 		// Only return attached partitions
 		query = fmt.Sprintf(`
@@ -393,7 +456,7 @@ func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDay
 				FROM pg_inherits i
 				JOIN pg_class c ON i.inhrelid = c.oid
 				JOIN pg_class p ON i.inhparent = p.oid
-				WHERE p.relname = @table_name
+				WHERE p.relname = $1
 			)
 			SELECT
 				tablename,
@@ -407,11 +470,12 @@ func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDay
 			LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relname = pg_tables.tablename
 				AND pg_stat_user_tables.schemaname = pg_tables.schemaname
 			WHERE pg_tables.schemaname = 'public'
-				AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
+				AND pg_tables.tablename LIKE $2 ESCAPE '\'
 				AND pg_tables.tablename IN (SELECT tablename FROM attached_partitions)
-				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < $3
 			ORDER BY partition_date ASC
 		`, sqlPattern, sqlPattern, sqlPattern)
+		args = []any{tableName, tablePattern, cutoffDate}
 	} else {
 		// Return all partitions (attached + detached)
 		query = fmt.Sprintf(`
@@ -427,18 +491,22 @@ func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDay
 			LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relname = pg_tables.tablename
 				AND pg_stat_user_tables.schemaname = pg_tables.schemaname
 			WHERE pg_tables.schemaname = 'public'
-				AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
-				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
+				AND pg_tables.tablename LIKE $1 ESCAPE '\'
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < $2
 			ORDER BY partition_date ASC
 		`, sqlPattern, sqlPattern, sqlPattern)
+		args = []any{tablePattern, cutoffDate}
 	}
-	result := dbp.DB.Raw(query,
-		sql.Named("table_name", tableName),
-		sql.Named("table_pattern", tablePattern),
-		sql.Named("cutoff_date", cutoffDate)).Scan(&partitions)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to get partitions for removal")
-		return nil, result.Error
+
+	rows, err := dbp.db.Query(query, args...)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to get partitions for removal")
+		return nil, err
+	}
+	partitions, err := scanRows(rows, scanPartitionInfo)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to get partitions for removal")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -478,6 +546,7 @@ func (dbp *DB_PARTITIONS) GetRetentionSummary(tableName string, retentionDays in
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
 	var query string
+	var args []any
 	if attachedOnly {
 		// Only consider attached partitions
 		query = fmt.Sprintf(`
@@ -486,20 +555,21 @@ func (dbp *DB_PARTITIONS) GetRetentionSummary(tableName string, retentionDays in
 				FROM pg_inherits i
 				JOIN pg_class c ON i.inhrelid = c.oid
 				JOIN pg_class p ON i.inhparent = p.oid
-				WHERE p.relname = @table_name
+				WHERE p.relname = $1
 			)
 			SELECT
 				COUNT(*)::INT AS partitions_to_remove,
 				COALESCE(SUM(pg_total_relation_size('public.'||tablename)), 0)::BIGINT AS storage_to_reclaim,
 				COALESCE(pg_size_pretty(SUM(pg_total_relation_size('public.'||tablename))), '0 bytes') AS storage_pretty,
-				MIN(tablename) AS oldest_partition,
-				MAX(tablename) AS newest_partition
+				COALESCE(MIN(tablename), '') AS oldest_partition,
+				COALESCE(MAX(tablename), '') AS newest_partition
 			FROM pg_tables
 			WHERE schemaname = 'public'
-				AND tablename LIKE @table_pattern ESCAPE '\'
+				AND tablename LIKE $2 ESCAPE '\'
 				AND tablename IN (SELECT tablename FROM attached_partitions)
-				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < $3
 		`, sqlPattern)
+		args = []any{tableName, tablePattern, cutoffDate}
 	} else {
 		// Consider all partitions (attached + detached)
 		query = fmt.Sprintf(`
@@ -507,21 +577,26 @@ func (dbp *DB_PARTITIONS) GetRetentionSummary(tableName string, retentionDays in
 				COUNT(*)::INT AS partitions_to_remove,
 				COALESCE(SUM(pg_total_relation_size('public.'||tablename)), 0)::BIGINT AS storage_to_reclaim,
 				COALESCE(pg_size_pretty(SUM(pg_total_relation_size('public.'||tablename))), '0 bytes') AS storage_pretty,
-				MIN(tablename) AS oldest_partition,
-				MAX(tablename) AS newest_partition
+				COALESCE(MIN(tablename), '') AS oldest_partition,
+				COALESCE(MAX(tablename), '') AS newest_partition
 			FROM pg_tables
 			WHERE schemaname = 'public'
-				AND tablename LIKE @table_pattern ESCAPE '\'
-				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < @cutoff_date
+				AND tablename LIKE $1 ESCAPE '\'
+				AND TO_DATE(SUBSTRING(tablename FROM '%s'), 'YYYY_MM_DD') < $2
 		`, sqlPattern)
+		args = []any{tablePattern, cutoffDate}
 	}
-	result := dbp.DB.Raw(query,
-		sql.Named("table_name", tableName),
-		sql.Named("table_pattern", tablePattern),
-		sql.Named("cutoff_date", cutoffDate)).Scan(&summary)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to get retention summary")
-		return nil, result.Error
+
+	err = dbp.db.QueryRow(query, args...).Scan(
+		&summary.PartitionsToRemove,
+		&summary.StorageToReclaim,
+		&summary.StoragePretty,
+		&summary.OldestPartition,
+		&summary.NewestPartition,
+	)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to get retention summary")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -613,13 +688,12 @@ func (dbp *DB_PARTITIONS) DropPartition(partitionName string, dryRun bool) error
 	}
 
 	query := "DROP TABLE IF EXISTS " + pq.QuoteIdentifier(partitionName)
-	result := dbp.DB.Exec(query)
-	if result.Error != nil {
-		log.WithError(result.Error).WithFields(log.Fields{
+	if _, err := dbp.db.Exec(query); err != nil {
+		log.WithError(err).WithFields(log.Fields{
 			"partition": partitionName,
 			"table":     tableName,
 		}).Error("failed to drop partition")
-		return result.Error
+		return err
 	}
 
 	elapsed := time.Since(start)
@@ -657,13 +731,12 @@ func (dbp *DB_PARTITIONS) DetachPartition(partitionName string, dryRun bool) err
 	}
 
 	query := fmt.Sprintf("ALTER TABLE %s DETACH PARTITION %s", pq.QuoteIdentifier(tableName), pq.QuoteIdentifier(partitionName))
-	result := dbp.DB.Exec(query)
-	if result.Error != nil {
-		log.WithError(result.Error).WithFields(log.Fields{
+	if _, err := dbp.db.Exec(query); err != nil {
+		log.WithError(err).WithFields(log.Fields{
 			"partition": partitionName,
 			"table":     tableName,
 		}).Error("failed to detach partition")
-		return result.Error
+		return err
 	}
 
 	elapsed := time.Since(start)
@@ -725,10 +798,9 @@ func (dbp *DB_PARTITIONS) DropOldDetachedPartitions(tableName string, retentionD
 	droppedCount := 0
 	var totalSize int64
 
-	err = dbp.DB.Transaction(func(tx *gorm.DB) error {
-		txDBC := &DB_PARTITIONS{DB: tx}
+	err = dbp.withTx(func(txp *DB_PARTITIONS) error {
 		for _, partition := range toRemove {
-			if err := txDBC.DropPartition(partition.TableName, false); err != nil {
+			if err := txp.DropPartition(partition.TableName, false); err != nil {
 				return fmt.Errorf("failed to drop partition %s: %w", partition.TableName, err)
 			}
 			droppedCount++
@@ -757,7 +829,6 @@ func (dbp *DB_PARTITIONS) DropOldDetachedPartitions(tableName string, retentionD
 // part of the partitioned table hierarchy
 func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
-	var partitions []PartitionInfo
 
 	// Detect partition format
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
@@ -777,7 +848,7 @@ func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionI
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
 			JOIN pg_class p ON i.inhparent = p.oid
-			WHERE p.relname = @table_name
+			WHERE p.relname = $1
 		)
 		SELECT
 			tablename,
@@ -791,16 +862,20 @@ func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionI
 		LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relname = pg_tables.tablename
 			AND pg_stat_user_tables.schemaname = pg_tables.schemaname
 		WHERE pg_tables.schemaname = 'public'
-			AND pg_tables.tablename LIKE @table_pattern ESCAPE '\'
+			AND pg_tables.tablename LIKE $2 ESCAPE '\'
 			AND pg_tables.tablename NOT IN (SELECT tablename FROM attached_partitions)
 		ORDER BY partition_date ASC
 	`, sqlPattern, sqlPattern)
-	result := dbp.DB.Raw(query,
-		sql.Named("table_name", tableName),
-		sql.Named("table_pattern", tablePattern)).Scan(&partitions)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to list detached partitions")
-		return nil, result.Error
+
+	rows, err := dbp.db.Query(query, tableName, tablePattern)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to list detached partitions")
+		return nil, err
+	}
+	partitions, err := scanRows(rows, scanPartitionInfo)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to list detached partitions")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -817,7 +892,6 @@ func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionI
 // These are partitions that are part of the active partitioned table hierarchy
 func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
-	var partitions []PartitionInfo
 
 	// Detect partition format
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
@@ -836,7 +910,7 @@ func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionI
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
 			JOIN pg_class p ON i.inhparent = p.oid
-			WHERE p.relname = @table_name
+			WHERE p.relname = $1
 		)
 		SELECT
 			tablename,
@@ -854,10 +928,15 @@ func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionI
 		ORDER BY partition_date ASC
 	`, sqlPattern, sqlPattern)
 
-	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&partitions)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to list attached partitions")
-		return nil, result.Error
+	rows, err := dbp.db.Query(query, tableName)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to list attached partitions")
+		return nil, err
+	}
+	partitions, err := scanRows(rows, scanPartitionInfo)
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to list attached partitions")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -873,7 +952,6 @@ func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionI
 // GetAttachedPartitionStats returns statistics about attached partitions for a given table
 func (dbp *DB_PARTITIONS) GetAttachedPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
-	var stats PartitionStats
 
 	// Detect partition format
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
@@ -891,7 +969,7 @@ func (dbp *DB_PARTITIONS) GetAttachedPartitionStats(tableName string) (*Partitio
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
 			JOIN pg_class p ON i.inhparent = p.oid
-			WHERE p.relname = @table_name
+			WHERE p.relname = $1
 		),
 		attached_info AS (
 			SELECT
@@ -913,10 +991,10 @@ func (dbp *DB_PARTITIONS) GetAttachedPartitionStats(tableName string) (*Partitio
 		FROM attached_info
 	`, sqlPattern)
 
-	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&stats)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to get attached partition statistics")
-		return nil, result.Error
+	stats, err := scanPartitionStats(dbp.db.QueryRow(query, tableName))
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to get attached partition statistics")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -933,21 +1011,6 @@ func (dbp *DB_PARTITIONS) GetAttachedPartitionStats(tableName string) (*Partitio
 // CreateMissingPartitions creates partitions for a date range if they don't already exist
 // Supports both standard format (tablename_YYYY_MM_DD) and pg_partman format (tablename_pYYYY_MM_DD)
 // Each partition covers a 24-hour period from midnight to midnight
-//
-// Workflow:
-//  1. Lists all existing partitions (both attached and detached)
-//  2. Generates list of missing dates in the specified range
-//  3. For each missing date: creates table and attaches it as partition
-//  4. Skips dates that already have partitions (attached or detached)
-//
-// Parameters:
-//   - tableName: Name of the partitioned parent table
-//   - startDate: Start of date range (inclusive)
-//   - endDate: End of date range (inclusive)
-//   - usePartmanFormat: If true, uses pg_partman naming format (tablename_pYYYY_MM_DD)
-//   - dryRun: If true, logs what would be created without executing
-//
-// Returns: Count of partitions created (or would be created in dry-run mode)
 func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, endDate time.Time, usePartmanFormat bool, dryRun bool) (int, error) {
 	start := time.Now()
 
@@ -1027,11 +1090,9 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 	}
 
 	createdCount := 0
-	err = dbp.DB.Transaction(func(tx *gorm.DB) error {
-		txDBC := &DB_PARTITIONS{DB: tx}
-
+	err = dbp.withTx(func(txp *DB_PARTITIONS) error {
 		for _, partitionName := range partitionsToReattach {
-			if err := txDBC.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
+			if err := txp.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
 				return fmt.Errorf("failed to reattach partition %s: %w", partitionName, err)
 			}
 		}
@@ -1040,11 +1101,11 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 			partitionName := buildPartitionName(tableName, partitionDate, usePartmanFormat)
 
 			createTableQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (LIKE %s INCLUDING ALL)", pq.QuoteIdentifier(partitionName), pq.QuoteIdentifier(tableName))
-			if result := tx.Exec(createTableQuery); result.Error != nil {
-				return fmt.Errorf("failed to create partition table %s: %w", partitionName, result.Error)
+			if _, err := txp.db.Exec(createTableQuery); err != nil {
+				return fmt.Errorf("failed to create partition table %s: %w", partitionName, err)
 			}
 
-			if err := txDBC.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
+			if err := txp.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
 				return fmt.Errorf("failed to attach partition %s: %w", partitionName, err)
 			}
 
@@ -1071,97 +1132,45 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 	return createdCount, nil
 }
 
-// gormTypeToPostgresType converts GORM/Go data types to PostgreSQL types
-
-// CreatePartitionedTable creates a new partitioned table based on a GORM model struct
+// CreatePartitionedTable creates a new partitioned table based on a model struct
 // If the table already exists, it returns without error
 //
-// Parameters:
-//   - model: GORM model struct (must be a pointer, e.g., &models.MyModel{})
-//   - tableName: Name for the partitioned table
-//   - config: Partition configuration (strategy, columns, etc.)
-//   - dryRun: If true, prints SQL without executing
-//
-// Returns: The SQL statement that was (or would be) executed
-//
-// Example:
-//
-//	config := partitions.NewRangePartitionConfig("created_at")
-//	sql, err := partitions.CreatePartitionedTable(dbc, &MyModel{}, "my_table", config, true)
-//
 //nolint:gocyclo
 
-// indexInfo holds information about a database index
-
-// UpdatePartitionedTable updates an existing partitioned table schema based on a GORM model.
-// If the table does not exist, it is created using CreatePartitionedTable with the provided config.
-// Detects differences between the model and current database schema and generates ALTER statements.
-//
-// Parameters:
-//   - model: GORM model struct (must be a pointer, e.g., &models.MyModel{})
-//   - tableName: Name of the partitioned table (created if it does not exist)
-//   - config: Partition configuration (used only when creating a new table)
-//   - dryRun: If true, prints SQL without executing
-//   - dropColumns: If true, columns present in the database but absent from the model will be dropped
-//
-// Returns: The SQL statements that were (or would be) executed
-//
-// Example:
-//
-//	config := db.NewRangePartitionConfig("created_at")
-//	sql, err := dbp.UpdatePartitionedTable(&MyModel{}, "my_table", config, true, false)
-//
-// Note: Cannot modify partition keys or add unique constraints without partition keys
+// UpdatePartitionedTable updates an existing partitioned table schema based on a model.
 //
 //nolint:gocyclo
-
-// getCurrentColumns retrieves the current column schema from the database
-// getCurrentIndexes retrieves the current indexes from the database
 
 // getPartitionColumns retrieves the partition key columns for a table
 func (dbp *DB_PARTITIONS) GetPartitionColumns(tableName string) ([]string, error) {
-	var columns []string
-
 	query := `
 		SELECT a.attname
 		FROM pg_class c
 		JOIN pg_partitioned_table pt ON pt.partrelid = c.oid
 		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(pt.partattrs)
-		WHERE c.relname = @table_name
+		WHERE c.relname = $1
 			AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
 		ORDER BY array_position(pt.partattrs, a.attnum)
 	`
 
-	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&columns)
-	if result.Error != nil {
-		return nil, result.Error
+	rows, err := dbp.db.Query(query, tableName)
+	if err != nil {
+		return nil, err
+	}
+	columns, err := scanRows(rows, func(r *sql.Rows) (string, error) {
+		var col string
+		return col, r.Scan(&col)
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return columns, nil
 }
 
-// makeTableSpecificIndexName creates a table-specific index name from index fields
-// This prevents index name collisions when creating multiple tables from the same model
-//
-// GORM often generates index names like "idx_{original_table_name}_{column_names}"
-// (e.g., "idx_prow_job_run_tests_suite_id"). When creating a different table like
-// "prow_job_run_tests_copy_1", we need to avoid the redundant name like
-// "prow_job_run_tests_copy_1_idx_prow_job_run_tests_suite_id".
-//
-// Instead, we extract the column names from the index fields and generate:
-// "{table_name}_idx_{column_names}"
-//
-// Examples:
-//   - Index fields: [suite_id] -> "prow_job_run_tests_copy_1_idx_suite_id"
-//   - Index fields: [created_at] -> "orders_copy_1_idx_created_at"
-//   - Index fields: [user_id, org_id] -> "users_backup_idx_user_id_org_id"
-
-// getPrimaryKeyColumns retrieves the columns that are part of the primary key for a table
-
 // GetDetachedPartitionStats returns statistics about detached partitions for a given table
 func (dbp *DB_PARTITIONS) GetDetachedPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
-	var stats PartitionStats
 
 	// Detect partition format
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
@@ -1180,7 +1189,7 @@ func (dbp *DB_PARTITIONS) GetDetachedPartitionStats(tableName string) (*Partitio
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
 			JOIN pg_class p ON i.inhparent = p.oid
-			WHERE p.relname = @table_name
+			WHERE p.relname = $1
 		),
 		detached_info AS (
 			SELECT
@@ -1189,7 +1198,7 @@ func (dbp *DB_PARTITIONS) GetDetachedPartitionStats(tableName string) (*Partitio
 				pg_total_relation_size('public.'||tablename) AS size_bytes
 			FROM pg_tables
 			WHERE schemaname = 'public'
-				AND tablename LIKE @table_pattern ESCAPE '\'
+				AND tablename LIKE $2 ESCAPE '\'
 				AND tablename NOT IN (SELECT tablename FROM attached_partitions)
 		)
 		SELECT
@@ -1203,12 +1212,10 @@ func (dbp *DB_PARTITIONS) GetDetachedPartitionStats(tableName string) (*Partitio
 		FROM detached_info
 	`, sqlPattern)
 
-	result := dbp.DB.Raw(query,
-		sql.Named("table_name", tableName),
-		sql.Named("table_pattern", tablePattern)).Scan(&stats)
-	if result.Error != nil {
-		log.WithError(result.Error).WithField("table", tableName).Error("failed to get detached partition statistics")
-		return nil, result.Error
+	stats, err := scanPartitionStats(dbp.db.QueryRow(query, tableName, tablePattern))
+	if err != nil {
+		log.WithError(err).WithField("table", tableName).Error("failed to get detached partition statistics")
+		return nil, err
 	}
 
 	elapsed := time.Since(start)
@@ -1269,13 +1276,12 @@ func (dbp *DB_PARTITIONS) AttachPartition(tableName, partitionName string, usePa
 		rangeEnd,
 	)
 
-	result := dbp.DB.Exec(query)
-	if result.Error != nil {
-		log.WithError(result.Error).WithFields(log.Fields{
+	if _, err := dbp.db.Exec(query); err != nil {
+		log.WithError(err).WithFields(log.Fields{
 			"partition": partitionName,
 			"table":     tableName,
 		}).Error("failed to attach partition")
-		return result.Error
+		return err
 	}
 
 	elapsed := time.Since(start)
@@ -1310,20 +1316,18 @@ func (dbp *DB_PARTITIONS) IsPartitionAttached(partitionName string) (bool, error
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
 			JOIN pg_class p ON i.inhparent = p.oid
-			WHERE p.relname = @table_name
-				AND c.relname = @partition_name
+			WHERE p.relname = $1
+				AND c.relname = $2
 		) AS is_attached
 	`
 
-	result := dbp.DB.Raw(query,
-		sql.Named("table_name", tableName),
-		sql.Named("partition_name", partitionName)).Scan(&isAttached)
-	if result.Error != nil {
-		log.WithError(result.Error).WithFields(log.Fields{
+	err = dbp.db.QueryRow(query, tableName, partitionName).Scan(&isAttached)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
 			"partition": partitionName,
 			"table":     tableName,
 		}).Error("failed to check partition status")
-		return false, result.Error
+		return false, err
 	}
 
 	elapsed := time.Since(start)
@@ -1371,10 +1375,9 @@ func (dbp *DB_PARTITIONS) DetachOldPartitions(tableName string, retentionDays in
 	detachedCount := 0
 	var totalSize int64
 
-	err = dbp.DB.Transaction(func(tx *gorm.DB) error {
-		txDBC := &DB_PARTITIONS{DB: tx}
+	err = dbp.withTx(func(txp *DB_PARTITIONS) error {
 		for _, partition := range partitions {
-			if err := txDBC.DetachPartition(partition.TableName, false); err != nil {
+			if err := txp.DetachPartition(partition.TableName, false); err != nil {
 				return fmt.Errorf("failed to detach partition %s: %w", partition.TableName, err)
 			}
 			detachedCount++
@@ -1407,7 +1410,7 @@ func buildPartitionName(tableName string, date time.Time, usePartmanFormat bool)
 	return fmt.Sprintf("%s_%s", tableName, dateStr)
 }
 
-// detectPartitionFormat examines existing partitions to determine naming format
+// DetectPartitionFormat examines existing partitions to determine naming format
 // Returns true if pg_partman format (_pYYYY_MM_DD), false for standard format
 // Returns error if table not found or has no partitions
 func (dbp *DB_PARTITIONS) DetectPartitionFormat(tableName string) (bool, error) {
@@ -1417,23 +1420,18 @@ func (dbp *DB_PARTITIONS) DetectPartitionFormat(tableName string) (bool, error) 
 		FROM pg_inherits i
 		JOIN pg_class c ON i.inhrelid = c.oid
 		JOIN pg_class p ON i.inhparent = p.oid
-		WHERE p.relname = @table_name
+		WHERE p.relname = $1
 		LIMIT 1
 	`
 
-	result := dbp.DB.Raw(query, sql.Named("table_name", tableName)).Scan(&partitionName)
-	if result.Error != nil {
-		return false, fmt.Errorf("failed to detect partition format: %w", result.Error)
-	}
-
-	if result.RowsAffected == 0 {
-		// No partitions found - default to standard format
+	err := dbp.db.QueryRow(query, tableName).Scan(&partitionName)
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
+	if err != nil {
+		return false, fmt.Errorf("failed to detect partition format: %w", err)
+	}
 
-	// Check if partition name contains _p followed by year (e.g., _p2026)
-	// pg_partman format: tablename_pYYYY_MM_DD
-	// standard format: tablename_YYYY_MM_DD
 	return strings.Contains(partitionName, "_p20"), nil
 }
 
