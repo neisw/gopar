@@ -766,24 +766,106 @@ func extractDateFromPartitionBounds(bounds string) *time.Time {
 }
 
 // RenamePartitionsToMatchConfig renames all partitions of tableName so that
-// their names match what buildNestedPartitionPrefix would produce for the
-// current table name and configuration. This is useful after a table swap
-// where partitions created under the old name (possibly hash-shortened)
-// no longer match the expected naming for the renamed table.
+// their names match what the current table name and configuration would produce.
+// This is useful after a table swap where partitions created under the old name
+// (possibly hash-shortened) no longer match the expected naming.
+//
+// When releases is non-empty, operates in LIST→RANGE mode: for each release,
+// computes the expected intermediate name via buildNestedPartitionPrefix, finds
+// the actual partition via catalog lookup, renames if different, then renames
+// daily children under it.
+//
+// When releases is empty, operates in flat RANGE mode: walks child partitions
+// of tableName directly, extracts dates, and renames to match the expected
+// tableName + dateSuffix pattern (shortening the table prefix if needed).
 func (dbp *DB_PARTITIONS) RenamePartitionsToMatchConfig(
 	tableName string,
 	releases []string,
 	usePartmanFormat bool,
 	dryRun bool,
 ) (int, error) {
-	renamedCount := 0
-
 	l := log.WithFields(log.Fields{
 		"table":   tableName,
 		"dry_run": dryRun,
 	})
 
-	l.Info("reconciling partition names with current table configuration")
+	if len(releases) == 0 {
+		return dbp.renameRangePartitions(tableName, usePartmanFormat, dryRun, l)
+	}
+	return dbp.renameNestedPartitions(tableName, releases, usePartmanFormat, dryRun, l)
+}
+
+// renameRangePartitions handles flat RANGE tables: walks child partitions,
+// extracts dates, computes expected names with truncation-aware prefix.
+func (dbp *DB_PARTITIONS) renameRangePartitions(
+	tableName string,
+	usePartmanFormat bool,
+	dryRun bool,
+	l *log.Entry,
+) (int, error) {
+	renamedCount := 0
+
+	l.Info("reconciling flat RANGE partition names")
+
+	children, err := dbp.getChildPartitions(tableName)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list children of %s: %w", tableName, err)
+	}
+
+	// Compute the table prefix, shortening if daily names would exceed the limit
+	prefix := tableName
+	maxDaily := len(tableName) + 1 + dateSuffixLen(usePartmanFormat)
+	if maxDaily > maxPartitionNameLen {
+		available := maxPartitionNameLen - dateSuffixLen(usePartmanFormat)
+		prefix = shortenTablePrefix(tableName, available)
+	}
+
+	for _, child := range children {
+		date := extractDateFromPartitionBounds(child.bounds)
+		if date == nil {
+			date = extractDateFromPartitionName(child.name)
+		}
+		if date == nil {
+			l.WithField("partition", child.name).Warn("could not extract date from partition, skipping")
+			continue
+		}
+
+		var expectedName string
+		if usePartmanFormat {
+			expectedName = fmt.Sprintf("%s_p%s", prefix, date.Format("2006_01_02"))
+		} else {
+			expectedName = fmt.Sprintf("%s_%s", prefix, date.Format("2006_01_02"))
+		}
+
+		if child.name == expectedName {
+			continue
+		}
+
+		renamed, err := dbp.renamePartition(child.name, expectedName, dryRun, l)
+		if err != nil {
+			return renamedCount, err
+		}
+		if renamed {
+			renamedCount++
+		}
+	}
+
+	l.WithField("total_renamed", renamedCount).Info("partition name reconciliation complete")
+	return renamedCount, nil
+}
+
+// renameNestedPartitions handles LIST→RANGE tables: for each release, renames
+// the intermediate partition and its daily children to match the expected naming.
+func (dbp *DB_PARTITIONS) renameNestedPartitions(
+	tableName string,
+	releases []string,
+	usePartmanFormat bool,
+	dryRun bool,
+	l *log.Entry,
+) (int, error) {
+	renamedCount := 0
+
+	l.Info("reconciling LIST → RANGE partition names")
 
 	for _, release := range releases {
 		expectedIntermediate := buildNestedPartitionPrefix(tableName, release, usePartmanFormat)
@@ -799,39 +881,13 @@ func (dbp *DB_PARTITIONS) RenamePartitionsToMatchConfig(
 
 		// Rename the intermediate partition if needed
 		if actualIntermediate != expectedIntermediate {
-			if err := validatePartitionNameLength(expectedIntermediate); err != nil {
-				return renamedCount, fmt.Errorf("cannot rename %s: target name too long: %w", actualIntermediate, err)
-			}
-
-			exists, err := dbp.partitionExists(expectedIntermediate)
+			renamed, err := dbp.renamePartition(actualIntermediate, expectedIntermediate, dryRun, l)
 			if err != nil {
-				return renamedCount, fmt.Errorf("failed to check if %s exists: %w", expectedIntermediate, err)
+				return renamedCount, err
 			}
-			if exists {
-				return renamedCount, fmt.Errorf("cannot rename %s to %s: target already exists", actualIntermediate, expectedIntermediate)
+			if renamed {
+				renamedCount++
 			}
-
-			if dryRun {
-				l.WithFields(log.Fields{
-					"from":    actualIntermediate,
-					"to":      expectedIntermediate,
-					"release": release,
-				}).Info("[DRY RUN] would rename intermediate partition")
-			} else {
-				renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
-					pq.QuoteIdentifier(actualIntermediate),
-					pq.QuoteIdentifier(expectedIntermediate),
-				)
-				if _, err := dbp.db.Exec(renameSQL); err != nil {
-					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", actualIntermediate, expectedIntermediate, err)
-				}
-				l.WithFields(log.Fields{
-					"from":    actualIntermediate,
-					"to":      expectedIntermediate,
-					"release": release,
-				}).Info("renamed intermediate partition")
-			}
-			renamedCount++
 		}
 
 		// Find daily child partitions under the intermediate (use the name
@@ -868,34 +924,47 @@ func (dbp *DB_PARTITIONS) RenamePartitionsToMatchConfig(
 				continue
 			}
 
-			if err := validatePartitionNameLength(expectedDaily); err != nil {
-				return renamedCount, fmt.Errorf("cannot rename %s: target name too long: %w", child.name, err)
+			renamed, err := dbp.renamePartition(child.name, expectedDaily, dryRun, l)
+			if err != nil {
+				return renamedCount, err
 			}
-
-			if dryRun {
-				l.WithFields(log.Fields{
-					"from": child.name,
-					"to":   expectedDaily,
-				}).Info("[DRY RUN] would rename daily partition")
-			} else {
-				renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
-					pq.QuoteIdentifier(child.name),
-					pq.QuoteIdentifier(expectedDaily),
-				)
-				if _, err := dbp.db.Exec(renameSQL); err != nil {
-					return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", child.name, expectedDaily, err)
-				}
-				l.WithFields(log.Fields{
-					"from": child.name,
-					"to":   expectedDaily,
-				}).Debug("renamed daily partition")
+			if renamed {
+				renamedCount++
 			}
-			renamedCount++
 		}
 	}
 
 	l.WithField("total_renamed", renamedCount).Info("partition name reconciliation complete")
 	return renamedCount, nil
+}
+
+// renamePartition renames a single partition from oldName to newName.
+// Returns true if the rename was performed (or would be in dry-run).
+func (dbp *DB_PARTITIONS) renamePartition(oldName, newName string, dryRun bool, l *log.Entry) (bool, error) {
+	if err := validatePartitionNameLength(newName); err != nil {
+		return false, fmt.Errorf("cannot rename %s: target name too long: %w", oldName, err)
+	}
+
+	if dryRun {
+		l.WithFields(log.Fields{
+			"from": oldName,
+			"to":   newName,
+		}).Info("[DRY RUN] would rename partition")
+		return true, nil
+	}
+
+	renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
+		pq.QuoteIdentifier(oldName),
+		pq.QuoteIdentifier(newName),
+	)
+	if _, err := dbp.db.Exec(renameSQL); err != nil {
+		return false, fmt.Errorf("failed to rename %s to %s: %w", oldName, newName, err)
+	}
+	l.WithFields(log.Fields{
+		"from": oldName,
+		"to":   newName,
+	}).Debug("renamed partition")
+	return true, nil
 }
 
 type childPartition struct {
@@ -925,94 +994,4 @@ func (dbp *DB_PARTITIONS) getChildPartitions(parentName string) ([]childPartitio
 		err := r.Scan(&c.name, &c.bounds)
 		return c, err
 	})
-}
-
-// RenamePartitionsAfterSwap renames all descendant partitions of tableName
-// that still carry oldPrefix from before a table swap. For each descendant
-// whose name starts with oldPrefix, the prefix is replaced with tableName.
-// Partitions are renamed deepest-first to avoid breaking parent references.
-func (dbp *DB_PARTITIONS) RenamePartitionsAfterSwap(
-	tableName string,
-	oldPrefix string,
-	dryRun bool,
-) (int, error) {
-	renamedCount := 0
-
-	l := log.WithFields(log.Fields{
-		"table":      tableName,
-		"old_prefix": oldPrefix,
-		"dry_run":    dryRun,
-	})
-
-	l.Info("renaming partitions after table swap")
-
-	query := `
-		WITH RECURSIVE partition_tree AS (
-			SELECT c.oid, c.relname
-			FROM pg_class c
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE c.relname = $1 AND n.nspname = 'public'
-			UNION ALL
-			SELECT child.oid, child.relname
-			FROM pg_inherits i
-			JOIN pg_class child ON child.oid = i.inhrelid
-			JOIN partition_tree pt ON pt.oid = i.inhparent
-		)
-		SELECT relname
-		FROM partition_tree
-		WHERE relname != $1
-		  AND relname LIKE $2 || '%'
-		ORDER BY length(relname) DESC
-	`
-
-	rows, err := dbp.db.Query(query, tableName, oldPrefix)
-	if err != nil {
-		return 0, fmt.Errorf("failed to query partition tree: %w", err)
-	}
-	partitions, err := scanRows(rows, func(r *sql.Rows) (string, error) {
-		var name string
-		err := r.Scan(&name)
-		return name, err
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to scan partition tree: %w", err)
-	}
-
-	if len(partitions) == 0 {
-		l.Info("no partitions found matching old prefix")
-		return 0, nil
-	}
-
-	l.WithField("count", len(partitions)).Info("found partitions to rename")
-
-	for _, oldName := range partitions {
-		newName := tableName + oldName[len(oldPrefix):]
-
-		if err := validatePartitionNameLength(newName); err != nil {
-			return renamedCount, fmt.Errorf("cannot rename %s: target name too long: %w", oldName, err)
-		}
-
-		if dryRun {
-			l.WithFields(log.Fields{
-				"from": oldName,
-				"to":   newName,
-			}).Info("[DRY RUN] would rename partition")
-		} else {
-			renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
-				pq.QuoteIdentifier(oldName),
-				pq.QuoteIdentifier(newName),
-			)
-			if _, err := dbp.db.Exec(renameSQL); err != nil {
-				return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", oldName, newName, err)
-			}
-			l.WithFields(log.Fields{
-				"from": oldName,
-				"to":   newName,
-			}).Debug("renamed partition")
-		}
-		renamedCount++
-	}
-
-	l.WithField("total_renamed", renamedCount).Info("partition rename after swap complete")
-	return renamedCount, nil
 }

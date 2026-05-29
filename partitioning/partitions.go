@@ -1028,47 +1028,30 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 			tableName, maxName, maxPartitionNameLen)
 	}
 
-	// Get list of all existing partitions (attached + detached)
-	existingPartitions, err := dbp.ListTablePartitions(tableName)
+	// Get the set of attached child partition names from pg_inherits (authoritative)
+	attachedSet, err := dbp.getAttachedPartitionNames(tableName)
 	if err != nil {
-		return 0, fmt.Errorf("failed to list existing partitions: %w", err)
+		return 0, fmt.Errorf("failed to list attached partitions: %w", err)
 	}
 
-	// Create a map of existing partition dates for quick lookup
-	existingDates := make(map[string]bool)
-	for _, p := range existingPartitions {
-		dateStr := p.PartitionDate.Format("2006_01_02")
-		existingDates[dateStr] = true
-	}
-
-	// Generate list of partitions to create and detached partitions to reattach
+	// For each date in the range, check if the expected partition already exists
 	var partitionsToCreate []time.Time
-	var partitionsToReattach []string
 	currentDate := startDate
 	for !currentDate.After(endDate) {
-		dateStr := currentDate.Format("2006_01_02")
-		if !existingDates[dateStr] {
+		partitionName := buildPartitionName(tableName, currentDate, usePartmanFormat)
+		if !attachedSet[partitionName] {
 			partitionsToCreate = append(partitionsToCreate, currentDate)
-		} else {
-			// Partition exists — verify it is attached
-			partitionName := buildPartitionName(tableName, currentDate, usePartmanFormat)
-			attached, err := dbp.IsPartitionAttached(partitionName)
-			if err != nil {
-				return 0, fmt.Errorf("failed to check if partition %s is attached: %w", partitionName, err)
-			}
-			if !attached {
-				partitionsToReattach = append(partitionsToReattach, partitionName)
-			}
 		}
-		currentDate = currentDate.AddDate(0, 0, 1) // Move to next day
+		currentDate = currentDate.AddDate(0, 0, 1)
 	}
 
-	if len(partitionsToCreate) == 0 && len(partitionsToReattach) == 0 {
+	if len(partitionsToCreate) == 0 {
 		log.WithFields(log.Fields{
 			"table":      tableName,
 			"start_date": startDate.Format("2006-01-02"),
 			"end_date":   endDate.Format("2006-01-02"),
-		}).Info("no missing partitions to create")
+			"attached":   len(attachedSet),
+		}).Info("all partitions already exist")
 		return 0, nil
 	}
 
@@ -1080,23 +1063,11 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 				"table":     tableName,
 			}).Info("[DRY RUN] would create partition")
 		}
-		for _, partitionName := range partitionsToReattach {
-			log.WithFields(log.Fields{
-				"partition": partitionName,
-				"table":     tableName,
-			}).Info("[DRY RUN] would reattach partition")
-		}
 		return len(partitionsToCreate), nil
 	}
 
 	createdCount := 0
 	err = dbp.withTx(func(txp *DB_PARTITIONS) error {
-		for _, partitionName := range partitionsToReattach {
-			if err := txp.AttachPartition(tableName, partitionName, usePartmanFormat, false); err != nil {
-				return fmt.Errorf("failed to reattach partition %s: %w", partitionName, err)
-			}
-		}
-
 		for _, partitionDate := range partitionsToCreate {
 			partitionName := buildPartitionName(tableName, partitionDate, usePartmanFormat)
 
@@ -1124,7 +1095,7 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitions(tableName string, startDate, e
 		"start_date": startDate.Format("2006-01-02"),
 		"end_date":   endDate.Format("2006-01-02"),
 		"created":    createdCount,
-		"reattached": len(partitionsToReattach),
+		"skipped":    len(attachedSet),
 		"dry_run":    dryRun,
 		"elapsed":    elapsed,
 	}).Info("completed creating missing partitions")
@@ -1399,6 +1370,34 @@ func (dbp *DB_PARTITIONS) DetachOldPartitions(tableName string, retentionDays in
 	}).Info("completed detaching old partitions")
 
 	return detachedCount, nil
+}
+
+// getAttachedPartitionNames returns the set of child partition names currently
+// attached to tableName, queried from pg_inherits (authoritative).
+func (dbp *DB_PARTITIONS) getAttachedPartitionNames(tableName string) (map[string]bool, error) {
+	query := `
+		SELECT c.relname
+		FROM pg_inherits i
+		JOIN pg_class c ON i.inhrelid = c.oid
+		JOIN pg_class p ON i.inhparent = p.oid
+		WHERE p.relname = $1
+	`
+	rows, err := dbp.db.Query(query, tableName)
+	if err != nil {
+		return nil, err
+	}
+	names, err := scanRows(rows, func(r *sql.Rows) (string, error) {
+		var name string
+		return name, r.Scan(&name)
+	})
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		set[n] = true
+	}
+	return set, nil
 }
 
 // buildPartitionName generates a partition name based on format preference

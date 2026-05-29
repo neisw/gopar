@@ -33,6 +33,7 @@ func main() {
 
 	rootCmd.AddCommand(
 		NewSQLCommand(),
+		NewManageCommand(),
 		NewVersionCommand(),
 	)
 

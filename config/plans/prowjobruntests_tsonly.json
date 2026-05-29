@@ -1,0 +1,54 @@
+{
+  "name": "prowjobruntests_tsonly_migration",
+  "description": "Migrate prow_job_run_tests and prow_job_run_test_outputs to timestamp-only RANGE partitioning",
+  "steps": [
+    {
+      "name": "create_partitioned_tables",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests_tsonly/003_create_partitioned_tables.json"
+    },
+    {
+      "name": "create_prow_job_run_tests_partitions",
+      "type": "create_partitions_range",
+      "table": "prow_job_run_tests_new",
+      "start_date": {"relative": "-100d"},
+      "end_date": {"relative": "+2d"},
+      "use_partman_format": true
+    },
+    {
+      "name": "create_prow_job_run_test_outputs_partitions",
+      "type": "create_partitions_range",
+      "table": "prow_job_run_test_outputs_new",
+      "start_date": {"relative": "-100d"},
+      "end_date": {"relative": "+2d"},
+      "use_partman_format": true
+    },
+    {
+      "name": "migrate_data",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests_tsonly/004_migrate_partitioned_tables_data.json"
+    },
+    {
+      "name": "sync_sequences",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests_tsonly/005_sync_sequences.json"
+    },
+    {
+      "name": "swap_tables",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests_tsonly/006_swap_partitioned_tables.json"
+    },
+    {
+      "name": "rename_prow_job_run_tests_partitions",
+      "type": "rename_partitions",
+      "table": "prow_job_run_tests",
+      "use_partman_format": true
+    },
+    {
+      "name": "rename_prow_job_run_test_outputs_partitions",
+      "type": "rename_partitions",
+      "table": "prow_job_run_test_outputs",
+      "use_partman_format": true
+    }
+  ]
+}

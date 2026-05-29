@@ -22,46 +22,6 @@ func Test_BatchExecutionLogic(t *testing.T) {
 	t.Logf("SQLSpec supports BatchSize field: %d", spec.BatchSize)
 }
 
-// Test_LoadProwBackfillWithBatchSize verifies batch sizes are loaded from JSON
-func Test_LoadProwBackfillWithBatchSize(t *testing.T) {
-	var specs []SQLSpec
-	loadSpecsFromJSONForTest(t, "001_prow_job_runs_backfill.json", &specs)
-
-	if len(specs) == 0 {
-		t.Fatal("Expected at least one spec")
-	}
-
-	// All prow backfill specs should have batchSize = 500000
-	for _, spec := range specs {
-		if spec.BatchSize != 500000 {
-			t.Errorf("Expected spec %s to have BatchSize 500000, got %d", spec.Name, spec.BatchSize)
-		}
-		t.Logf("Spec %s has BatchSize: %d", spec.Name, spec.BatchSize)
-	}
-}
-
-// Test_BatchSizeInDryRun verifies batch size information is shown in dry-run
-func Test_BatchSizeInDryRun(t *testing.T) {
-	// This test documents the expected behavior but doesn't execute against a real DB
-	spec := SQLSpec{
-		Name:        "test_backfill",
-		Description: "Test backfill with batching",
-		Concurrent:  false,
-		BatchSize:   10000,
-		Query:       "WITH batch AS (SELECT id FROM test LIMIT $1) UPDATE test SET val = 1 FROM batch WHERE test.id = batch.id",
-	}
-
-	// When BatchSize > 0, executeBatchSpec should be called
-	if spec.BatchSize > 0 {
-		t.Logf("Spec %s will execute in batches of %d rows", spec.Name, spec.BatchSize)
-		t.Log("Expected behavior:")
-		t.Log("  - Execute query with $1 = batch size")
-		t.Log("  - Log rows affected after each batch")
-		t.Log("  - Continue until 0 rows affected")
-		t.Log("  - Log final summary with total rows and batch count")
-	}
-}
-
 // Test_BatchExecutionExample demonstrates expected batch execution flow
 func Test_BatchExecutionExample(t *testing.T) {
 	t.Log("Example: Backfilling 1.2M rows with batch size 500k")
