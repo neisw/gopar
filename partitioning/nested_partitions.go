@@ -24,6 +24,19 @@ const maxPartitionNameLen = 62
 // a table name prefix must be shortened (underscore + 4 hex digits).
 const hashSuffixLen = 5
 
+// isPartitionOverlapError returns true if err represents PostgreSQL SQLSTATE
+// 42P17 (invalid_object_definition), which is raised when a new partition's
+// bounds overlap an existing partition. It first tries errors.As with
+// *pq.Error; if that fails (e.g. because the error was wrapped by an
+// intermediate layer that breaks the chain) it falls back to string matching.
+func isPartitionOverlapError(err error) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code) == "42P17"
+	}
+	return strings.Contains(err.Error(), "42P17")
+}
+
 func validatePartitionNameLength(name string) error {
 	if len(name) > maxPartitionNameLen {
 		return fmt.Errorf("partition name %q is %d characters, exceeds safe limit of %d",
@@ -474,8 +487,7 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 					// partition for this list value already exists under a
 					// different name — e.g. after a table rename where a
 					// hash-shortened name no longer matches the computed name.
-					var pqErr *pq.Error
-					if errors.As(err, &pqErr) && string(pqErr.Code) == "42P17" {
+					if isPartitionOverlapError(err) {
 						existingName, findErr := dbp.findPartitionForListValue(tableName, release)
 						if findErr == nil && existingName != "" {
 							l.WithFields(log.Fields{
@@ -913,4 +925,94 @@ func (dbp *DB_PARTITIONS) getChildPartitions(parentName string) ([]childPartitio
 		err := r.Scan(&c.name, &c.bounds)
 		return c, err
 	})
+}
+
+// RenamePartitionsAfterSwap renames all descendant partitions of tableName
+// that still carry oldPrefix from before a table swap. For each descendant
+// whose name starts with oldPrefix, the prefix is replaced with tableName.
+// Partitions are renamed deepest-first to avoid breaking parent references.
+func (dbp *DB_PARTITIONS) RenamePartitionsAfterSwap(
+	tableName string,
+	oldPrefix string,
+	dryRun bool,
+) (int, error) {
+	renamedCount := 0
+
+	l := log.WithFields(log.Fields{
+		"table":      tableName,
+		"old_prefix": oldPrefix,
+		"dry_run":    dryRun,
+	})
+
+	l.Info("renaming partitions after table swap")
+
+	query := `
+		WITH RECURSIVE partition_tree AS (
+			SELECT c.oid, c.relname
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1 AND n.nspname = 'public'
+			UNION ALL
+			SELECT child.oid, child.relname
+			FROM pg_inherits i
+			JOIN pg_class child ON child.oid = i.inhrelid
+			JOIN partition_tree pt ON pt.oid = i.inhparent
+		)
+		SELECT relname
+		FROM partition_tree
+		WHERE relname != $1
+		  AND relname LIKE $2 || '%'
+		ORDER BY length(relname) DESC
+	`
+
+	rows, err := dbp.db.Query(query, tableName, oldPrefix)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query partition tree: %w", err)
+	}
+	partitions, err := scanRows(rows, func(r *sql.Rows) (string, error) {
+		var name string
+		err := r.Scan(&name)
+		return name, err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to scan partition tree: %w", err)
+	}
+
+	if len(partitions) == 0 {
+		l.Info("no partitions found matching old prefix")
+		return 0, nil
+	}
+
+	l.WithField("count", len(partitions)).Info("found partitions to rename")
+
+	for _, oldName := range partitions {
+		newName := tableName + oldName[len(oldPrefix):]
+
+		if err := validatePartitionNameLength(newName); err != nil {
+			return renamedCount, fmt.Errorf("cannot rename %s: target name too long: %w", oldName, err)
+		}
+
+		if dryRun {
+			l.WithFields(log.Fields{
+				"from": oldName,
+				"to":   newName,
+			}).Info("[DRY RUN] would rename partition")
+		} else {
+			renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
+				pq.QuoteIdentifier(oldName),
+				pq.QuoteIdentifier(newName),
+			)
+			if _, err := dbp.db.Exec(renameSQL); err != nil {
+				return renamedCount, fmt.Errorf("failed to rename %s to %s: %w", oldName, newName, err)
+			}
+			l.WithFields(log.Fields{
+				"from": oldName,
+				"to":   newName,
+			}).Debug("renamed partition")
+		}
+		renamedCount++
+	}
+
+	l.WithField("total_renamed", renamedCount).Info("partition rename after swap complete")
+	return renamedCount, nil
 }
