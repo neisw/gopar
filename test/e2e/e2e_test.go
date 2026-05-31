@@ -684,3 +684,274 @@ func TestListPartitionedTables(t *testing.T) {
 	}
 	assert.True(t, found, "should find the test table in partitioned tables list")
 }
+
+// TestBoundsRegexDiagnostic verifies the SQL regex used in getAttachedLeafPartitions
+// actually matches what pg_get_expr returns for partition bounds.
+func TestBoundsRegexDiagnostic(t *testing.T) {
+	db := getE2EDB(t)
+	dbp := partitioning.NewPartitions(db)
+	tableName := "e2e_regex_diag"
+
+	_, err := db.Exec(fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id BIGINT,
+			release TEXT NOT NULL,
+			created_at DATE NOT NULL
+		) PARTITION BY LIST (release)
+	`, tableName))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		dropTable(t, db, tableName)
+		rows, err := db.Query(`
+			SELECT tablename FROM pg_tables
+			WHERE schemaname = 'public' AND tablename LIKE 'e2e_regex_diag_%'
+		`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var name string
+				if rows.Scan(&name) == nil {
+					db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", name))
+				}
+			}
+		}
+	})
+
+	releases := []string{"4.17"}
+	startDate := time.Now().AddDate(0, 0, -3)
+	endDate := time.Now()
+
+	count, err := dbp.CreateMissingPartitionsListToRange(
+		tableName, releases, startDate, endDate, "created_at", true, false,
+	)
+	require.NoError(t, err)
+	require.Greater(t, count, 0)
+
+	t.Run("pg_get_expr returns expected format", func(t *testing.T) {
+		// Query the actual partition bounds to verify the format
+		rows, err := db.Query(`
+			WITH RECURSIVE partition_tree AS (
+				SELECT c.oid, c.relname AS table_name, 0 AS level
+				FROM pg_class c
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE c.relname = $1 AND n.nspname = 'public'
+				UNION ALL
+				SELECT child.oid, child.relname, pt.level + 1
+				FROM partition_tree pt
+				JOIN pg_class parent ON parent.relname = pt.table_name
+				JOIN pg_inherits i ON i.inhparent = parent.oid
+				JOIN pg_class child ON child.oid = i.inhrelid
+			)
+			SELECT
+				pt.table_name,
+				pg_get_expr(c.relpartbound, c.oid) AS bound_raw,
+				pt.level
+			FROM partition_tree pt
+			JOIN pg_class c ON c.relname = pt.table_name
+			WHERE pt.level > 0
+			ORDER BY pt.level, pt.table_name
+		`, tableName)
+		require.NoError(t, err)
+		defer rows.Close()
+
+		for rows.Next() {
+			var name, bounds string
+			var level int
+			require.NoError(t, rows.Scan(&name, &bounds, &level))
+			t.Logf("level=%d name=%s bounds=%q", level, name, bounds)
+
+			if level == 2 {
+				// Leaf RANGE partition — bounds should contain FROM ('YYYY-MM-DD')
+				assert.Contains(t, bounds, "FOR VALUES FROM", "leaf partition should have RANGE bounds")
+				assert.Contains(t, bounds, "TO", "leaf partition should have TO clause")
+			}
+		}
+		require.NoError(t, rows.Err())
+	})
+
+	t.Run("regex extracts date from actual bounds", func(t *testing.T) {
+		// Use the exact same regex as getAttachedLeafPartitions
+		rows, err := db.Query(`
+			WITH RECURSIVE partition_tree AS (
+				SELECT c.oid, c.relname AS table_name, 0 AS level
+				FROM pg_class c
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE c.relname = $1 AND n.nspname = 'public'
+				UNION ALL
+				SELECT child.oid, child.relname, pt.level + 1
+				FROM partition_tree pt
+				JOIN pg_class parent ON parent.relname = pt.table_name
+				JOIN pg_inherits i ON i.inhparent = parent.oid
+				JOIN pg_class child ON child.oid = i.inhrelid
+			)
+			SELECT
+				pt.table_name,
+				pg_get_expr(c.relpartbound, c.oid) AS bound_raw,
+				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})''') AS extracted_date
+			FROM partition_tree pt
+			JOIN pg_class c ON c.relname = pt.table_name
+			WHERE NOT EXISTS (SELECT 1 FROM pg_partitioned_table pp WHERE pp.partrelid = c.oid)
+			AND pt.level > 0
+			ORDER BY pt.table_name
+		`, tableName)
+		require.NoError(t, err)
+		defer rows.Close()
+
+		leafCount := 0
+		for rows.Next() {
+			var name, bounds string
+			var extractedDate sql.NullString
+			require.NoError(t, rows.Scan(&name, &bounds, &extractedDate))
+			t.Logf("name=%s bounds=%q extracted_date=%v (valid=%v)", name, bounds, extractedDate.String, extractedDate.Valid)
+
+			assert.True(t, extractedDate.Valid, "regex should extract date from bounds for partition %s (bounds: %s)", name, bounds)
+			if extractedDate.Valid {
+				_, err := time.Parse("2006-01-02", extractedDate.String)
+				assert.NoError(t, err, "extracted date should parse as YYYY-MM-DD for partition %s", name)
+			}
+			leafCount++
+		}
+		require.NoError(t, rows.Err())
+		assert.Greater(t, leafCount, 0, "should have leaf partitions to test")
+	})
+
+	t.Run("getAttachedLeafPartitions returns correct dates", func(t *testing.T) {
+		attached, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		require.Greater(t, len(attached), 0, "should have attached partitions")
+
+		for _, p := range attached {
+			assert.False(t, p.PartitionDate.IsZero(), "partition %s should have non-zero date", p.TableName)
+			// Verify the date is within the expected range
+			assert.True(t, !p.PartitionDate.Before(startDate.AddDate(0, 0, -1)),
+				"partition %s date %s should not be before start date %s",
+				p.TableName, p.PartitionDate.Format("2006-01-02"), startDate.Format("2006-01-02"))
+			assert.True(t, !p.PartitionDate.After(endDate.AddDate(0, 0, 1)),
+				"partition %s date %s should not be after end date %s",
+				p.TableName, p.PartitionDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+			t.Logf("partition=%s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		}
+	})
+}
+
+// TestNestedRetentionPrecision verifies that DetachOldPartitions on a nested table
+// only detaches partitions older than the retention period and never touches recent ones.
+func TestNestedRetentionPrecision(t *testing.T) {
+	db := getE2EDB(t)
+	dbp := partitioning.NewPartitions(db)
+	tableName := "e2e_retention_prec"
+
+	_, err := db.Exec(fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id BIGINT,
+			release TEXT NOT NULL,
+			created_at DATE NOT NULL
+		) PARTITION BY LIST (release)
+	`, tableName))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		dropTable(t, db, tableName)
+		rows, err := db.Query(`
+			SELECT tablename FROM pg_tables
+			WHERE schemaname = 'public' AND tablename LIKE 'e2e_retention_prec_%'
+		`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var name string
+				if rows.Scan(&name) == nil {
+					db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", name))
+				}
+			}
+		}
+	})
+
+	releases := []string{"4.17", "4.18"}
+
+	// Create partitions at 3 distinct age groups:
+	// 1. Old: -100 days (should be detached with 90-day retention)
+	// 2. Medium: -50 days (should NOT be detached with 90-day retention)
+	// 3. Recent: -5 days (should NOT be detached)
+	oldDate := time.Now().AddDate(0, 0, -100)
+	mediumDate := time.Now().AddDate(0, 0, -50)
+	recentDate := time.Now().AddDate(0, 0, -5)
+
+	for _, label := range []struct {
+		start time.Time
+		end   time.Time
+		name  string
+	}{
+		{oldDate, oldDate.AddDate(0, 0, 2), "old"},
+		{mediumDate, mediumDate.AddDate(0, 0, 2), "medium"},
+		{recentDate, recentDate.AddDate(0, 0, 2), "recent"},
+	} {
+		count, err := dbp.CreateMissingPartitionsListToRange(
+			tableName, releases, label.start, label.end, "created_at", true, false,
+		)
+		require.NoError(t, err, "creating %s partitions", label.name)
+		require.Greater(t, count, 0, "should create %s partitions", label.name)
+	}
+
+	// Record partition state before detach
+	attachedBefore, err := dbp.ListAttachedPartitions(tableName)
+	require.NoError(t, err)
+	totalBefore := len(attachedBefore)
+	t.Logf("total attached before detach: %d", totalBefore)
+
+	// Log all partitions and their dates
+	for _, p := range attachedBefore {
+		t.Logf("  before: %s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+	}
+
+	// Count how many are actually old (>90 days)
+	cutoff := time.Now().AddDate(0, 0, -90)
+	expectedOld := 0
+	for _, p := range attachedBefore {
+		if p.PartitionDate.Before(cutoff) {
+			expectedOld++
+		}
+	}
+	t.Logf("partitions older than 90 days: %d", expectedOld)
+	require.Greater(t, expectedOld, 0, "should have some old partitions")
+
+	// Detach with 90-day retention
+	detached, err := dbp.DetachOldPartitions(tableName, 90, false)
+	require.NoError(t, err)
+	assert.Equal(t, expectedOld, detached, "should only detach partitions older than 90 days")
+
+	// Verify remaining attached partitions
+	attachedAfter, err := dbp.ListAttachedPartitions(tableName)
+	require.NoError(t, err)
+
+	for _, p := range attachedAfter {
+		t.Logf("  after: %s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		assert.True(t, !p.PartitionDate.Before(cutoff),
+			"partition %s (date=%s) should NOT have been detached — it is within the 90-day retention window",
+			p.TableName, p.PartitionDate.Format("2006-01-02"))
+	}
+
+	expectedRemaining := totalBefore - expectedOld
+	assert.Equal(t, expectedRemaining, len(attachedAfter),
+		"remaining attached partitions should equal total minus detached")
+
+	// Specifically verify medium (50-day) and recent (5-day) partitions survive
+	mediumCutoff := mediumDate.AddDate(0, 0, -1)
+	mediumEnd := mediumDate.AddDate(0, 0, 3)
+	var mediumSurvivors int
+	for _, p := range attachedAfter {
+		if p.PartitionDate.After(mediumCutoff) && p.PartitionDate.Before(mediumEnd) {
+			mediumSurvivors++
+		}
+	}
+	assert.Greater(t, mediumSurvivors, 0, "50-day-old partitions should NOT be detached")
+
+	recentCutoff := recentDate.AddDate(0, 0, -1)
+	recentEnd := recentDate.AddDate(0, 0, 3)
+	var recentSurvivors int
+	for _, p := range attachedAfter {
+		if p.PartitionDate.After(recentCutoff) && p.PartitionDate.Before(recentEnd) {
+			recentSurvivors++
+		}
+	}
+	assert.Greater(t, recentSurvivors, 0, "5-day-old partitions should NOT be detached")
+}
