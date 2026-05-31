@@ -88,7 +88,7 @@ func shortenTablePrefix(name string, maxLen int) string {
 // Returns the intermediate prefix and the (possibly shortened) table prefix.
 func buildNestedPartitionPrefix(tableName, release string, usePartmanFormat bool) string {
 	safeName := sanitizePartitionName(release)
-	full := tableName + "_" + safeName
+	full := tableName + "_p" + safeName
 
 	// Check if the longest daily name fits
 	maxDaily := len(full) + dateSuffixLen(usePartmanFormat)
@@ -97,10 +97,10 @@ func buildNestedPartitionPrefix(tableName, release string, usePartmanFormat bool
 	}
 
 	// Calculate how much space the table prefix can use:
-	// total = tablePrefix + "_" + safeName + dateSuffix
-	available := maxPartitionNameLen - dateSuffixLen(usePartmanFormat) - 1 - len(safeName)
+	// total = tablePrefix + "_p" + safeName + dateSuffix
+	available := maxPartitionNameLen - dateSuffixLen(usePartmanFormat) - 2 - len(safeName)
 	shortened := shortenTablePrefix(tableName, available)
-	return shortened + "_" + safeName
+	return shortened + "_p" + safeName
 }
 
 // GetPartitionHierarchy returns the complete partition hierarchy for a table
@@ -454,9 +454,9 @@ func (dbp *DB_PARTITIONS) CreateMissingPartitionsListToRange(
 	for _, release := range releases {
 		intermediatePartition := buildNestedPartitionPrefix(tableName, release, usePartmanFormat)
 
-		if intermediatePartition != tableName+"_"+sanitizePartitionName(release) {
+		if intermediatePartition != tableName+"_p"+sanitizePartitionName(release) {
 			l.WithFields(log.Fields{
-				"original":  tableName + "_" + sanitizePartitionName(release),
+				"original":  tableName + "_p" + sanitizePartitionName(release),
 				"shortened": intermediatePartition,
 			}).Info("shortened partition prefix to fit PostgreSQL identifier limit")
 		}

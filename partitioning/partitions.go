@@ -1651,11 +1651,11 @@ func (dbp *DB_PARTITIONS) getAttachedLeafPartitions(tableName string) ([]Partiti
 			pt.table_name,
 			'public' AS schemaname,
 			TO_DATE(
-				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})'),
+				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})'''),
 				'YYYY-MM-DD'
 			) AS partition_date,
 			(CURRENT_DATE - TO_DATE(
-				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})'),
+				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})'''),
 				'YYYY-MM-DD'
 			))::INT AS age_days,
 			pg_total_relation_size('public.' || pt.table_name) AS size_bytes,
@@ -1668,7 +1668,7 @@ func (dbp *DB_PARTITIONS) getAttachedLeafPartitions(tableName string) ([]Partiti
 			SELECT 1 FROM pg_partitioned_table pp WHERE pp.partrelid = c.oid
 		)
 		AND pt.level > 0
-		AND substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})') IS NOT NULL
+		AND substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})''') IS NOT NULL
 		ORDER BY partition_date ASC
 	`
 	rows, err := dbp.db.Query(query, tableName)

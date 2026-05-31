@@ -136,8 +136,8 @@ func Test_buildNestedPartitionPrefix(t *testing.T) {
 		{
 			name:      "standard format at limit unchanged",
 			tableName: "prow_job_run_annotations_new",
-			release:   "aro_classic_production",
-			// 28 + 1 + 22 + 11 = 62, fits
+			release:   "aro_classic_prod",
+			// 28 + 2 + 16 + 11 = 57, fits
 		},
 		{
 			name:             "partman format triggers shortening",
@@ -145,7 +145,14 @@ func Test_buildNestedPartitionPrefix(t *testing.T) {
 			release:          "aro_classic_production",
 			usePartmanFormat: true,
 			wantShortened:    true,
-			// 28 + 1 + 22 + 12 = 63, over limit
+			// 28 + 2 + 22 + 12 = 64, over limit
+		},
+		{
+			name:          "standard format over limit triggers shortening",
+			tableName:     "prow_job_run_annotations_new",
+			release:       "aro_classic_production",
+			wantShortened: true,
+			// 28 + 2 + 22 + 11 = 63, over limit
 		},
 		{
 			name:          "very long release triggers shortening",
@@ -159,7 +166,7 @@ func Test_buildNestedPartitionPrefix(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := buildNestedPartitionPrefix(tt.tableName, tt.release, tt.usePartmanFormat)
 			safeName := sanitizePartitionName(tt.release)
-			full := tt.tableName + "_" + safeName
+			full := tt.tableName + "_p" + safeName
 
 			maxDaily := len(result) + dateSuffixLen(tt.usePartmanFormat)
 			if maxDaily > maxPartitionNameLen {
@@ -250,34 +257,34 @@ func Test_nestedPartitionNameOverflow(t *testing.T) {
 		{
 			name:      "standard format at limit",
 			tableName: "prow_job_run_annotations_new",
-			release:   "aro_classic_production",
-			wantErr:   false, // 28 + 1 + 22 + 11 = 62, exactly at limit
+			release:   "aro_classic_prod",
+			wantErr:   false, // 28 + 2 + 16 + 11 = 57, fits
 		},
 		{
 			name:             "partman format overflows",
 			tableName:        "prow_job_run_annotations_new",
 			release:          "aro_classic_production",
 			usePartmanFormat: true,
-			wantErr:          true, // 28 + 1 + 22 + 12 = 63, over limit of 62
+			wantErr:          true, // 28 + 2 + 22 + 12 = 64, over limit of 62
 		},
 		{
 			name:      "exactly at limit",
-			tableName: strings.Repeat("a", 25),
+			tableName: strings.Repeat("a", 24),
 			release:   strings.Repeat("b", 25),
-			wantErr:   false, // 25 + 1 + 25 + 11 = 62
+			wantErr:   false, // 24 + 2 + 25 + 11 = 62
 		},
 		{
 			name:      "one over limit",
-			tableName: strings.Repeat("a", 26),
+			tableName: strings.Repeat("a", 25),
 			release:   strings.Repeat("b", 25),
-			wantErr:   true, // 26 + 1 + 25 + 11 = 63
+			wantErr:   true, // 25 + 2 + 25 + 11 = 63
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			safeName := sanitizePartitionName(tt.release)
-			intermediate := tt.tableName + "_" + safeName
+			intermediate := tt.tableName + "_p" + safeName
 			maxDaily := len(intermediate) + dateSuffixLen(tt.usePartmanFormat)
 			overflows := maxDaily > maxPartitionNameLen
 
