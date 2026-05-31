@@ -30,7 +30,7 @@ BUILD_DATE?=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildDate=$(BUILD_DATE)"
 
 .PHONY: all build clean test test-all test-unit test-integration test-coverage \
-	install uninstall fmt vet lint run help \
+	install uninstall fmt vet lint run help e2e \
 	build-linux build-darwin build-windows build-all
 
 # Default target
@@ -123,6 +123,10 @@ test-integration:
 	fi
 	cd $(CMD_DIR) && GOPAR_TEST_DSN="$(GOPAR_TEST_DSN)" $(GOTEST) -v -timeout 0 \
 		-run "Test_CreatePartitionIndexes|Test_BackfillDenormalizedColumns|Test_ExecuteSQLSpecs" ./...
+
+## e2e: Run e2e tests (starts PostgreSQL container, runs partition lifecycle tests)
+e2e:
+	./scripts/e2e.sh
 
 ## test-coverage: Run tests with coverage report
 test-coverage:

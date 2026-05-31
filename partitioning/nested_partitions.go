@@ -144,7 +144,7 @@ func (dbp *DB_PARTITIONS) GetPartitionHierarchy(tableName string) ([]PartitionHi
 					ELSE NULL
 				END AS strategy,
 				pg_get_expr(pp.partexprs, pp.partrelid) AS partition_key,
-				pg_get_expr(child.relpartbound, child.oid) AS partition_bounds,
+				pg_get_expr(child.relpartbound, child.oid) COLLATE "default" AS partition_bounds,
 				EXISTS(SELECT 1 FROM pg_partitioned_table WHERE partrelid = child.oid) AS is_partitioned,
 				child.oid AS partition_oid
 			FROM partition_tree pt
