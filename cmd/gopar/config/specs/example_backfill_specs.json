@@ -1,0 +1,7 @@
+[
+  {
+    "tableName": "example_table",
+    "description": "Backfill status column with default value",
+    "updateQuery": "UPDATE example_table SET status = 'active' WHERE status IS NULL"
+  }
+]

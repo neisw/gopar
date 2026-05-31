@@ -324,14 +324,31 @@ func (dbp *DB_PARTITIONS) ListPartitionedTables() ([]PartitionedTableInfo, error
 func (dbp *DB_PARTITIONS) ListTablePartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		partitions, err := dbp.getAttachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		log.WithFields(log.Fields{
+			"table":   tableName,
+			"count":   len(partitions),
+			"nested":  true,
+			"elapsed": time.Since(start),
+		}).Info("listed table partitions")
+		return partitions, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build SQL pattern based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
@@ -363,28 +380,89 @@ func (dbp *DB_PARTITIONS) ListTablePartitions(tableName string) ([]PartitionInfo
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":   tableName,
 		"count":   len(partitions),
-		"elapsed": elapsed,
+		"elapsed": time.Since(start),
 	}).Info("listed table partitions")
 
 	return partitions, nil
+}
+
+// computeStatsFromPartitions builds PartitionStats from a slice of PartitionInfo.
+// Used by nested partition code paths where SQL-level aggregation isn't possible.
+func computeStatsFromPartitions(partitions []PartitionInfo) PartitionStats {
+	stats := PartitionStats{TotalPartitions: len(partitions)}
+	if len(partitions) == 0 {
+		return stats
+	}
+	for _, p := range partitions {
+		stats.TotalSizeBytes += p.SizeBytes
+	}
+	stats.AvgSizeBytes = stats.TotalSizeBytes / int64(len(partitions))
+	stats.OldestDate = sql.NullTime{Time: partitions[0].PartitionDate, Valid: true}
+	stats.NewestDate = sql.NullTime{Time: partitions[len(partitions)-1].PartitionDate, Valid: true}
+	stats.TotalSizePretty = formatBytes(stats.TotalSizeBytes)
+	stats.AvgSizePretty = formatBytes(stats.AvgSizeBytes)
+	return stats
+}
+
+func formatBytes(b int64) string {
+	const (
+		kB = 1024
+		mB = kB * 1024
+		gB = mB * 1024
+		tB = gB * 1024
+	)
+	switch {
+	case b >= tB:
+		return fmt.Sprintf("%.1f TB", float64(b)/float64(tB))
+	case b >= gB:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(gB))
+	case b >= mB:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(mB))
+	case b >= kB:
+		return fmt.Sprintf("%.1f kB", float64(b)/float64(kB))
+	default:
+		return fmt.Sprintf("%d bytes", b)
+	}
 }
 
 // GetPartitionStats returns aggregate statistics about partitions for a given table
 func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		attached, err := dbp.getAttachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		detached, err := dbp.getDetachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		all := append(attached, detached...)
+		stats := computeStatsFromPartitions(all)
+		log.WithFields(log.Fields{
+			"table":            tableName,
+			"total_partitions": stats.TotalPartitions,
+			"total_size":       stats.TotalSizePretty,
+			"nested":           true,
+			"elapsed":          time.Since(start),
+		}).Info("retrieved partition statistics")
+		return &stats, nil
+	}
+
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build patterns based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
@@ -415,12 +493,11 @@ func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, 
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":            tableName,
 		"total_partitions": stats.TotalPartitions,
 		"total_size":       stats.TotalSizePretty,
-		"elapsed":          elapsed,
+		"elapsed":          time.Since(start),
 	}).Info("retrieved partition statistics")
 
 	return &stats, nil
@@ -432,24 +509,61 @@ func (dbp *DB_PARTITIONS) GetPartitionStats(tableName string) (*PartitionStats, 
 // If attachedOnly is false, returns all partitions (useful for drop operations on both attached and detached)
 func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDays int, attachedOnly bool) ([]PartitionInfo, error) {
 	start := time.Now()
-
 	cutoffDate := time.Now().AddDate(0, 0, -retentionDays)
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		var candidates []PartitionInfo
+		if attachedOnly {
+			candidates, err = dbp.getAttachedLeafPartitions(tableName)
+		} else {
+			attached, err2 := dbp.getAttachedLeafPartitions(tableName)
+			if err2 != nil {
+				return nil, err2
+			}
+			detached, err2 := dbp.getDetachedLeafPartitions(tableName)
+			if err2 != nil {
+				return nil, err2
+			}
+			candidates = append(attached, detached...)
+		}
+		if err != nil {
+			return nil, err
+		}
+		var partitions []PartitionInfo
+		for _, p := range candidates {
+			if p.PartitionDate.Before(cutoffDate) {
+				partitions = append(partitions, p)
+			}
+		}
+		log.WithFields(log.Fields{
+			"table":          tableName,
+			"retention_days": retentionDays,
+			"cutoff_date":    cutoffDate.Format("2006-01-02"),
+			"attached_only":  attachedOnly,
+			"nested":         true,
+			"count":          len(partitions),
+			"elapsed":        time.Since(start),
+		}).Info("identified partitions for removal")
+		return partitions, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build patterns based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
 	var query string
 	var args []any
 	if attachedOnly {
-		// Only return attached partitions
 		query = fmt.Sprintf(`
 			WITH attached_partitions AS (
 				SELECT c.relname AS tablename
@@ -477,7 +591,6 @@ func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDay
 		`, sqlPattern, sqlPattern, sqlPattern)
 		args = []any{tableName, tablePattern, cutoffDate}
 	} else {
-		// Return all partitions (attached + detached)
 		query = fmt.Sprintf(`
 			SELECT
 				tablename,
@@ -509,14 +622,13 @@ func (dbp *DB_PARTITIONS) GetPartitionsForRemoval(tableName string, retentionDay
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":          tableName,
 		"retention_days": retentionDays,
 		"cutoff_date":    cutoffDate.Format("2006-01-02"),
 		"attached_only":  attachedOnly,
 		"count":          len(partitions),
-		"elapsed":        elapsed,
+		"elapsed":        time.Since(start),
 	}).Info("identified partitions for removal")
 
 	return partitions, nil
@@ -534,21 +646,49 @@ func (dbp *DB_PARTITIONS) GetRetentionSummary(tableName string, retentionDays in
 	summary.RetentionDays = retentionDays
 	summary.CutoffDate = cutoffDate
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		partitions, err := dbp.GetPartitionsForRemoval(tableName, retentionDays, attachedOnly)
+		if err != nil {
+			return nil, err
+		}
+		summary.PartitionsToRemove = len(partitions)
+		for _, p := range partitions {
+			summary.StorageToReclaim += p.SizeBytes
+		}
+		summary.StoragePretty = formatBytes(summary.StorageToReclaim)
+		if len(partitions) > 0 {
+			summary.OldestPartition = partitions[0].TableName
+			summary.NewestPartition = partitions[len(partitions)-1].TableName
+		}
+		log.WithFields(log.Fields{
+			"table":                tableName,
+			"retention_days":       retentionDays,
+			"attached_only":        attachedOnly,
+			"nested":               true,
+			"partitions_to_remove": summary.PartitionsToRemove,
+			"storage_to_reclaim":   summary.StoragePretty,
+			"elapsed":              time.Since(start),
+		}).Info("calculated retention summary")
+		return &summary, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build patterns based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
 	var query string
 	var args []any
 	if attachedOnly {
-		// Only consider attached partitions
 		query = fmt.Sprintf(`
 			WITH attached_partitions AS (
 				SELECT c.relname AS tablename
@@ -571,7 +711,6 @@ func (dbp *DB_PARTITIONS) GetRetentionSummary(tableName string, retentionDays in
 		`, sqlPattern)
 		args = []any{tableName, tablePattern, cutoffDate}
 	} else {
-		// Consider all partitions (attached + detached)
 		query = fmt.Sprintf(`
 			SELECT
 				COUNT(*)::INT AS partitions_to_remove,
@@ -599,14 +738,13 @@ func (dbp *DB_PARTITIONS) GetRetentionSummary(tableName string, retentionDays in
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":                tableName,
 		"retention_days":       retentionDays,
 		"attached_only":        attachedOnly,
 		"partitions_to_remove": summary.PartitionsToRemove,
 		"storage_to_reclaim":   summary.StoragePretty,
-		"elapsed":              elapsed,
+		"elapsed":              time.Since(start),
 	}).Info("calculated retention summary")
 
 	return &summary, nil
@@ -830,20 +968,36 @@ func (dbp *DB_PARTITIONS) DropOldDetachedPartitions(tableName string, retentionD
 func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		partitions, err := dbp.getDetachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		log.WithFields(log.Fields{
+			"table":   tableName,
+			"count":   len(partitions),
+			"nested":  true,
+			"elapsed": time.Since(start),
+		}).Info("listed detached partitions")
+		return partitions, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build patterns based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
 	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
-			-- Get all currently attached partitions using pg_inherits
 			SELECT c.relname AS tablename
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
@@ -878,11 +1032,10 @@ func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionI
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":   tableName,
 		"count":   len(partitions),
-		"elapsed": elapsed,
+		"elapsed": time.Since(start),
 	}).Info("listed detached partitions")
 
 	return partitions, nil
@@ -893,19 +1046,35 @@ func (dbp *DB_PARTITIONS) ListDetachedPartitions(tableName string) ([]PartitionI
 func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionInfo, error) {
 	start := time.Now()
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		partitions, err := dbp.getAttachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		log.WithFields(log.Fields{
+			"table":   tableName,
+			"count":   len(partitions),
+			"nested":  true,
+			"elapsed": time.Since(start),
+		}).Info("listed attached partitions")
+		return partitions, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build pattern based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 
 	query := fmt.Sprintf(`
 		WITH attached_partitions AS (
-			-- Get all currently attached partitions using pg_inherits
 			SELECT c.relname AS tablename
 			FROM pg_inherits i
 			JOIN pg_class c ON i.inhrelid = c.oid
@@ -939,11 +1108,10 @@ func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionI
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":   tableName,
 		"count":   len(partitions),
-		"elapsed": elapsed,
+		"elapsed": time.Since(start),
 	}).Info("listed attached partitions")
 
 	return partitions, nil
@@ -953,14 +1121,33 @@ func (dbp *DB_PARTITIONS) ListAttachedPartitions(tableName string) ([]PartitionI
 func (dbp *DB_PARTITIONS) GetAttachedPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		partitions, err := dbp.getAttachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		stats := computeStatsFromPartitions(partitions)
+		log.WithFields(log.Fields{
+			"table":            tableName,
+			"total_partitions": stats.TotalPartitions,
+			"total_size":       stats.TotalSizePretty,
+			"nested":           true,
+			"elapsed":          time.Since(start),
+		}).Info("retrieved attached partition statistics")
+		return &stats, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build pattern based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 
 	query := fmt.Sprintf(`
@@ -997,12 +1184,11 @@ func (dbp *DB_PARTITIONS) GetAttachedPartitionStats(tableName string) (*Partitio
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":            tableName,
 		"total_partitions": stats.TotalPartitions,
 		"total_size":       stats.TotalSizePretty,
-		"elapsed":          elapsed,
+		"elapsed":          time.Since(start),
 	}).Info("retrieved attached partition statistics")
 
 	return &stats, nil
@@ -1143,14 +1329,33 @@ func (dbp *DB_PARTITIONS) GetPartitionColumns(tableName string) ([]string, error
 func (dbp *DB_PARTITIONS) GetDetachedPartitionStats(tableName string) (*PartitionStats, error) {
 	start := time.Now()
 
-	// Detect partition format
+	nested, err := dbp.isNestedPartitioned(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check partition nesting: %w", err)
+	}
+	if nested {
+		partitions, err := dbp.getDetachedLeafPartitions(tableName)
+		if err != nil {
+			return nil, err
+		}
+		stats := computeStatsFromPartitions(partitions)
+		log.WithFields(log.Fields{
+			"table":            tableName,
+			"total_partitions": stats.TotalPartitions,
+			"total_size":       stats.TotalSizePretty,
+			"nested":           true,
+			"elapsed":          time.Since(start),
+		}).Info("retrieved detached partition statistics")
+		return &stats, nil
+	}
+
+	// Flat partition path
 	usePartmanFormat, err := dbp.DetectPartitionFormat(tableName)
 	if err != nil {
 		log.WithError(err).WithField("table", tableName).Debug("failed to detect partition format, assuming standard")
 		usePartmanFormat = false
 	}
 
-	// Build patterns based on detected format
 	sqlPattern := GetPartitionSQLPattern(usePartmanFormat)
 	tablePattern := getPartitionLikePattern(tableName, usePartmanFormat)
 
@@ -1189,12 +1394,11 @@ func (dbp *DB_PARTITIONS) GetDetachedPartitionStats(tableName string) (*Partitio
 		return nil, err
 	}
 
-	elapsed := time.Since(start)
 	log.WithFields(log.Fields{
 		"table":            tableName,
 		"total_partitions": stats.TotalPartitions,
 		"total_size":       stats.TotalSizePretty,
-		"elapsed":          elapsed,
+		"elapsed":          time.Since(start),
 	}).Info("retrieved detached partition statistics")
 
 	return &stats, nil
@@ -1398,6 +1602,136 @@ func (dbp *DB_PARTITIONS) getAttachedPartitionNames(tableName string) (map[strin
 		set[n] = true
 	}
 	return set, nil
+}
+
+// isNestedPartitioned returns true if the table has nested partitioning
+// (i.e., any direct child partition is itself further partitioned).
+func (dbp *DB_PARTITIONS) isNestedPartitioned(tableName string) (bool, error) {
+	var nested bool
+	query := `
+		SELECT EXISTS(
+			SELECT 1
+			FROM pg_inherits i
+			JOIN pg_class child ON child.oid = i.inhrelid
+			JOIN pg_class parent ON parent.oid = i.inhparent
+			JOIN pg_partitioned_table pt ON pt.partrelid = child.oid
+			WHERE parent.relname = $1
+		)
+	`
+	err := dbp.db.QueryRow(query, tableName).Scan(&nested)
+	return nested, err
+}
+
+// getAttachedLeafPartitions returns PartitionInfo for all leaf partitions
+// currently attached to the table, walking the full hierarchy recursively.
+// Dates are extracted from partition bounds, not names.
+func (dbp *DB_PARTITIONS) getAttachedLeafPartitions(tableName string) ([]PartitionInfo, error) {
+	query := `
+		WITH RECURSIVE partition_tree AS (
+			SELECT
+				c.oid,
+				c.relname AS table_name,
+				0 AS level
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1 AND n.nspname = 'public'
+
+			UNION ALL
+
+			SELECT
+				child.oid,
+				child.relname AS table_name,
+				pt.level + 1
+			FROM partition_tree pt
+			JOIN pg_class parent ON parent.relname = pt.table_name
+			JOIN pg_inherits i ON i.inhparent = parent.oid
+			JOIN pg_class child ON child.oid = i.inhrelid
+		)
+		SELECT
+			pt.table_name,
+			'public' AS schemaname,
+			TO_DATE(
+				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})'),
+				'YYYY-MM-DD'
+			) AS partition_date,
+			(CURRENT_DATE - TO_DATE(
+				substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})'),
+				'YYYY-MM-DD'
+			))::INT AS age_days,
+			pg_total_relation_size('public.' || pt.table_name) AS size_bytes,
+			pg_size_pretty(pg_total_relation_size('public.' || pt.table_name)) AS size_pretty,
+			COALESCE(s.n_live_tup, 0) AS row_estimate
+		FROM partition_tree pt
+		JOIN pg_class c ON c.relname = pt.table_name
+		LEFT JOIN pg_stat_user_tables s ON s.relname = pt.table_name AND s.schemaname = 'public'
+		WHERE NOT EXISTS (
+			SELECT 1 FROM pg_partitioned_table pp WHERE pp.partrelid = c.oid
+		)
+		AND pt.level > 0
+		AND substring(pg_get_expr(c.relpartbound, c.oid) FROM 'FROM \(''(\d{4}-\d{2}-\d{2})') IS NOT NULL
+		ORDER BY partition_date ASC
+	`
+	rows, err := dbp.db.Query(query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query attached leaf partitions: %w", err)
+	}
+	return scanRows(rows, scanPartitionInfo)
+}
+
+// getDetachedLeafPartitions returns PartitionInfo for leaf partitions that were
+// detached from a nested partitioned table. It finds tables whose names start
+// with tableName_ and have an extractable date suffix, then subtracts the
+// set of currently attached leaves.
+func (dbp *DB_PARTITIONS) getDetachedLeafPartitions(tableName string) ([]PartitionInfo, error) {
+	attached, err := dbp.getAttachedLeafPartitions(tableName)
+	if err != nil {
+		return nil, err
+	}
+	attachedSet := make(map[string]bool, len(attached))
+	for _, p := range attached {
+		attachedSet[p.TableName] = true
+	}
+
+	// Find all tables whose name starts with tableName_ (broad match)
+	likePattern := escapeForLike(tableName) + "\\_%"
+	query := `
+		SELECT tablename
+		FROM pg_tables
+		WHERE schemaname = 'public'
+			AND tablename LIKE $1 ESCAPE '\'
+	`
+	rows, err := dbp.db.Query(query, likePattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query candidate tables: %w", err)
+	}
+	candidates, err := scanRows(rows, func(r *sql.Rows) (string, error) {
+		var name string
+		return name, r.Scan(&name)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var detached []PartitionInfo
+	now := time.Now()
+	for _, name := range candidates {
+		if attachedSet[name] {
+			continue
+		}
+		date := extractDateFromPartitionName(name)
+		if date == nil {
+			continue
+		}
+		age := int(now.Sub(*date).Hours() / 24)
+		detached = append(detached, PartitionInfo{
+			TableName:     name,
+			SchemaName:    "public",
+			PartitionDate: *date,
+			Age:           age,
+		})
+	}
+
+	return detached, nil
 }
 
 // buildPartitionName generates a partition name based on format preference

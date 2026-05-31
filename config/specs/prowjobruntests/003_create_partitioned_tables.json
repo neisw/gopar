@@ -58,5 +58,23 @@
     "description": "Index on prow_job_run_test_outputs_new for test output lookups",
     "concurrent": false,
     "query": "CREATE INDEX IF NOT EXISTS idx_prow_job_run_test_outputs_new_prow_job_run_test_id ON prow_job_run_test_outputs_new (prow_job_run_test_id)"
+  },
+  {
+    "name": "create_test_analysis_by_job_by_dates_new",
+    "description": "Create test_analysis_by_job_by_dates_new partitioned table (LIST by release, sub-partitioned by RANGE on date)",
+    "concurrent": false,
+    "query": "CREATE TABLE IF NOT EXISTS test_analysis_by_job_by_dates_new (\n\tdate TIMESTAMP WITH TIME ZONE,\n\ttest_id BIGINT,\n\trelease TEXT NOT NULL,\n\tjob_name TEXT,\n\ttest_name TEXT,\n\truns BIGINT,\n\tpasses BIGINT,\n\tflakes BIGINT,\n\tfailures BIGINT\n) PARTITION BY LIST (release)"
+  },
+  {
+    "name": "idx_test_analysis_new_test_release_date",
+    "description": "Unique index matching the original test_release_date constraint",
+    "concurrent": false,
+    "query": "CREATE UNIQUE INDEX IF NOT EXISTS idx_test_analysis_new_test_release_date ON test_analysis_by_job_by_dates_new (date, test_id, release, job_name)"
+  },
+  {
+    "name": "idx_test_analysis_new_name_and_job",
+    "description": "Index matching the original test_analysis_name_and_job index",
+    "concurrent": false,
+    "query": "CREATE INDEX IF NOT EXISTS idx_test_analysis_new_name_and_job ON test_analysis_by_job_by_dates_new (test_name, job_name)"
   }
 ]
