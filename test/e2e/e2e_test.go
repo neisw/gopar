@@ -955,3 +955,209 @@ func TestNestedRetentionPrecision(t *testing.T) {
 	}
 	assert.Greater(t, recentSurvivors, 0, "5-day-old partitions should NOT be detached")
 }
+
+// TestTimestampPartitionBounds verifies that the date extraction regex works
+// when the partition column is TIMESTAMP WITH TIME ZONE (not DATE).
+// pg_get_expr returns 'FROM (”2026-04-11 00:00:00+00”)' for timestamps,
+// vs 'FROM (”2026-04-11”)' for dates. The regex must handle both.
+func TestTimestampPartitionBounds(t *testing.T) {
+	db := getE2EDB(t)
+	dbp := partitioning.NewPartitions(db)
+
+	t.Run("flat range with timestamp column", func(t *testing.T) {
+		tableName := "e2e_ts_flat"
+		_, err := db.Exec(fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s (
+				id BIGINT,
+				created_at TIMESTAMP WITH TIME ZONE NOT NULL
+			) PARTITION BY RANGE (created_at)
+		`, tableName))
+		require.NoError(t, err)
+		t.Cleanup(func() { dropTable(t, db, tableName) })
+
+		startDate := time.Now().AddDate(0, 0, -5)
+		endDate := time.Now().AddDate(0, 0, 1)
+
+		count, err := dbp.CreateMissingPartitions(tableName, startDate, endDate, true, false)
+		require.NoError(t, err)
+		require.Greater(t, count, 0)
+
+		partitions, err := dbp.ListTablePartitions(tableName)
+		require.NoError(t, err)
+		assert.Equal(t, count, len(partitions), "should list all created partitions")
+
+		for _, p := range partitions {
+			assert.False(t, p.PartitionDate.IsZero(),
+				"partition %s should have non-zero date (bounds extraction must work with timestamp format)", p.TableName)
+			t.Logf("partition=%s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		}
+	})
+
+	t.Run("nested list-range with timestamp column", func(t *testing.T) {
+		tableName := "e2e_ts_nested"
+		_, err := db.Exec(fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s (
+				id BIGINT,
+				release TEXT NOT NULL,
+				created_at TIMESTAMP WITH TIME ZONE NOT NULL
+			) PARTITION BY LIST (release)
+		`, tableName))
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			dropTable(t, db, tableName)
+			rows, err := db.Query(`
+				SELECT tablename FROM pg_tables
+				WHERE schemaname = 'public' AND tablename LIKE 'e2e_ts_nested_%'
+			`)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var name string
+					if rows.Scan(&name) == nil {
+						db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", name))
+					}
+				}
+			}
+		})
+
+		releases := []string{"4.17", "4.18"}
+		startDate := time.Now().AddDate(0, 0, -5)
+		endDate := time.Now().AddDate(0, 0, 1)
+
+		count, err := dbp.CreateMissingPartitionsListToRange(
+			tableName, releases, startDate, endDate, "created_at", true, false,
+		)
+		require.NoError(t, err)
+		require.Greater(t, count, 0)
+
+		// Verify pg_get_expr returns timestamp format and regex still extracts dates
+		var boundsExample string
+		err = db.QueryRow(`
+			WITH RECURSIVE partition_tree AS (
+				SELECT c.oid, c.relname AS table_name, 0 AS level
+				FROM pg_class c
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE c.relname = $1 AND n.nspname = 'public'
+				UNION ALL
+				SELECT child.oid, child.relname, pt.level + 1
+				FROM partition_tree pt
+				JOIN pg_class parent ON parent.relname = pt.table_name
+				JOIN pg_inherits i ON i.inhparent = parent.oid
+				JOIN pg_class child ON child.oid = i.inhrelid
+			)
+			SELECT pg_get_expr(c.relpartbound, c.oid)
+			FROM partition_tree pt
+			JOIN pg_class c ON c.relname = pt.table_name
+			WHERE NOT EXISTS (SELECT 1 FROM pg_partitioned_table pp WHERE pp.partrelid = c.oid)
+			AND pt.level > 0
+			LIMIT 1
+		`, tableName).Scan(&boundsExample)
+		require.NoError(t, err)
+		t.Logf("actual pg_get_expr output for timestamp column: %q", boundsExample)
+
+		// ListAttachedPartitions uses getAttachedLeafPartitions which uses the regex
+		attached, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		require.Greater(t, len(attached), 0, "should find attached leaf partitions")
+
+		for _, p := range attached {
+			assert.False(t, p.PartitionDate.IsZero(),
+				"partition %s should have non-zero date extracted from timestamp bounds", p.TableName)
+			t.Logf("partition=%s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		}
+	})
+
+	t.Run("nested timestamp retention does not detach recent", func(t *testing.T) {
+		tableName := "e2e_ts_retention"
+		_, err := db.Exec(fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s (
+				id BIGINT,
+				release TEXT NOT NULL,
+				created_at TIMESTAMP WITH TIME ZONE NOT NULL
+			) PARTITION BY LIST (release)
+		`, tableName))
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			dropTable(t, db, tableName)
+			rows, err := db.Query(`
+				SELECT tablename FROM pg_tables
+				WHERE schemaname = 'public' AND tablename LIKE 'e2e_ts_retention_%'
+			`)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var name string
+					if rows.Scan(&name) == nil {
+						db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", name))
+					}
+				}
+			}
+		})
+
+		releases := []string{"4.18"}
+
+		// Old partitions (>90 days)
+		oldStart := time.Now().AddDate(0, 0, -100)
+		oldEnd := oldStart.AddDate(0, 0, 2)
+		count, err := dbp.CreateMissingPartitionsListToRange(
+			tableName, releases, oldStart, oldEnd, "created_at", true, false,
+		)
+		require.NoError(t, err)
+		require.Greater(t, count, 0)
+
+		// Recent partitions (50 days) — these must NOT be detached
+		recentStart := time.Now().AddDate(0, 0, -50)
+		recentEnd := recentStart.AddDate(0, 0, 2)
+		count, err = dbp.CreateMissingPartitionsListToRange(
+			tableName, releases, recentStart, recentEnd, "created_at", true, false,
+		)
+		require.NoError(t, err)
+		require.Greater(t, count, 0)
+
+		// Very recent partitions
+		veryRecentStart := time.Now().AddDate(0, 0, -3)
+		veryRecentEnd := time.Now().AddDate(0, 0, 1)
+		count, err = dbp.CreateMissingPartitionsListToRange(
+			tableName, releases, veryRecentStart, veryRecentEnd, "created_at", true, false,
+		)
+		require.NoError(t, err)
+		require.Greater(t, count, 0)
+
+		attachedBefore, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		t.Logf("attached before detach: %d", len(attachedBefore))
+		for _, p := range attachedBefore {
+			t.Logf("  %s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		}
+
+		// Count expected old partitions
+		cutoff := time.Now().AddDate(0, 0, -90)
+		expectedOld := 0
+		for _, p := range attachedBefore {
+			if p.PartitionDate.Before(cutoff) {
+				expectedOld++
+			}
+		}
+		require.Greater(t, expectedOld, 0, "should have old partitions")
+
+		// Detach with 90-day retention
+		detached, err := dbp.DetachOldPartitions(tableName, 90, false)
+		require.NoError(t, err)
+		assert.Equal(t, expectedOld, detached,
+			"should only detach old partitions, not recent ones (timestamp bounds)")
+
+		attachedAfter, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		t.Logf("attached after detach: %d", len(attachedAfter))
+
+		for _, p := range attachedAfter {
+			assert.False(t, p.PartitionDate.Before(cutoff),
+				"partition %s (date=%s) should NOT have been detached — within 90-day window",
+				p.TableName, p.PartitionDate.Format("2006-01-02"))
+		}
+
+		expectedRemaining := len(attachedBefore) - expectedOld
+		assert.Equal(t, expectedRemaining, len(attachedAfter),
+			"only old partitions should have been removed")
+	})
+}
