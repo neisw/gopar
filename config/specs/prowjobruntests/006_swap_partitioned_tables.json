@@ -3,12 +3,12 @@
     "name": "swap_prow_job_run_tests_and_outputs",
     "description": "Atomic table swap: drop FKs, rename old sequences and tables to _old, rename new sequences and tables to production names",
     "concurrent": false,
-    "query": "BEGIN; ALTER TABLE prow_job_run_tests DROP CONSTRAINT IF EXISTS fk_prow_job_run_tests_prow_job_run_id; ALTER TABLE prow_job_run_test_outputs DROP CONSTRAINT IF EXISTS fk_prow_job_run_test_outputs_prow_job_run_test_id; ALTER SEQUENCE prow_job_run_tests_id_seq RENAME TO prow_job_run_tests_old_id_seq; ALTER SEQUENCE prow_job_run_test_outputs_id_seq RENAME TO prow_job_run_test_outputs_old_id_seq; ALTER TABLE prow_job_run_tests RENAME TO prow_job_run_tests_old; ALTER TABLE prow_job_run_test_outputs RENAME TO prow_job_run_test_outputs_old; ALTER SEQUENCE prow_job_run_tests_new_id_seq RENAME TO prow_job_run_tests_id_seq; ALTER SEQUENCE prow_job_run_test_outputs_new_id_seq RENAME TO prow_job_run_test_outputs_id_seq; ALTER TABLE prow_job_run_tests_new RENAME TO prow_job_run_tests; ALTER TABLE prow_job_run_test_outputs_new RENAME TO prow_job_run_test_outputs; COMMIT"
+    "query": "ALTER TABLE prow_job_run_tests DROP CONSTRAINT IF EXISTS fk_prow_job_run_tests_prow_job_run_id; ALTER TABLE prow_job_run_test_outputs DROP CONSTRAINT IF EXISTS fk_prow_job_run_test_outputs_prow_job_run_test_id; ALTER SEQUENCE prow_job_run_tests_id_seq RENAME TO prow_job_run_tests_old_id_seq; ALTER SEQUENCE prow_job_run_test_outputs_id_seq RENAME TO prow_job_run_test_outputs_old_id_seq; ALTER TABLE prow_job_run_tests RENAME TO prow_job_run_tests_old; ALTER TABLE prow_job_run_test_outputs RENAME TO prow_job_run_test_outputs_old; ALTER SEQUENCE prow_job_run_tests_new_id_seq RENAME TO prow_job_run_tests_id_seq; ALTER SEQUENCE prow_job_run_test_outputs_new_id_seq RENAME TO prow_job_run_test_outputs_id_seq; ALTER TABLE prow_job_run_tests_new RENAME TO prow_job_run_tests; ALTER TABLE prow_job_run_test_outputs_new RENAME TO prow_job_run_test_outputs; "
   },
   {
     "name": "swap_test_analysis_by_job_by_dates",
     "description": "Atomic table swap: rename old table to _old, rename new table to production name",
     "concurrent": false,
-    "query": "BEGIN; ALTER TABLE test_analysis_by_job_by_dates RENAME TO test_analysis_by_job_by_dates_old; ALTER TABLE test_analysis_by_job_by_dates_new RENAME TO test_analysis_by_job_by_dates; COMMIT"
+    "query": "ALTER TABLE test_analysis_by_job_by_dates RENAME TO test_analysis_by_job_by_dates_old; ALTER TABLE test_analysis_by_job_by_dates_new RENAME TO test_analysis_by_job_by_dates; "
   }
 ]

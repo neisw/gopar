@@ -39,7 +39,7 @@
       "table": "test_analysis_by_job_by_dates_new",
       "releases_from": "releases",
       "date_column": "date",
-      "start_date": {"relative": "-300d"},
+      "start_date": {"relative": "-105d"},
       "end_date": {"relative": "+2d"},
       "use_partman_format": true
     },

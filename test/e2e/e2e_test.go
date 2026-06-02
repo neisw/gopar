@@ -1161,3 +1161,190 @@ func TestTimestampPartitionBounds(t *testing.T) {
 			"only old partitions should have been removed")
 	})
 }
+
+// TestFlatTimestampLifecycle mimics the existing test_analysis_by_job_by_dates table:
+// a flat RANGE-partitioned table with a TIMESTAMP WITH TIME ZONE column.
+// It exercises the full partition lifecycle: create, detach old, drop old detached.
+func TestFlatTimestampLifecycle(t *testing.T) {
+	db := getE2EDB(t)
+	dbp := partitioning.NewPartitions(db)
+	tableName := "e2e_ts_lifecycle"
+
+	_, err := db.Exec(fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			date TIMESTAMP WITH TIME ZONE NOT NULL,
+			test_id BIGINT,
+			release TEXT NOT NULL,
+			job_name TEXT,
+			test_name TEXT,
+			runs BIGINT,
+			passes BIGINT,
+			flakes BIGINT,
+			failures BIGINT
+		) PARTITION BY RANGE (date)
+	`, tableName))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		dropTable(t, db, tableName)
+		rows, err := db.Query(`
+			SELECT tablename FROM pg_tables
+			WHERE schemaname = 'public' AND tablename LIKE 'e2e_ts_lifecycle_%'
+		`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var name string
+				if rows.Scan(&name) == nil {
+					db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", name))
+				}
+			}
+		}
+	})
+
+	// Seed partitions at three age tiers:
+	// - very old (115 days): will be detached AND dropped
+	// - old (105 days): will be detached but NOT dropped
+	// - recent (today): should survive untouched
+	veryOldStart := time.Now().AddDate(0, 0, -115)
+	veryOldEnd := veryOldStart.AddDate(0, 0, 2)
+	oldStart := time.Now().AddDate(0, 0, -105)
+	oldEnd := oldStart.AddDate(0, 0, 2)
+	recentStart := time.Now().AddDate(0, 0, -3)
+	recentEnd := recentStart.AddDate(0, 0, 2)
+
+	for _, tier := range []struct {
+		start, end time.Time
+		label      string
+	}{
+		{veryOldStart, veryOldEnd, "very old (115d)"},
+		{oldStart, oldEnd, "old (105d)"},
+		{recentStart, recentEnd, "recent"},
+	} {
+		count, err := dbp.CreateMissingPartitions(tableName, tier.start, tier.end, true, false)
+		require.NoError(t, err, "creating %s partitions", tier.label)
+		require.Greater(t, count, 0, "should create %s partitions", tier.label)
+		t.Logf("created %d %s partitions", count, tier.label)
+	}
+
+	t.Run("add partitions for today+2", func(t *testing.T) {
+		start := time.Now()
+		end := time.Now().AddDate(0, 0, 3)
+		count, err := dbp.CreateMissingPartitions(tableName, start, end, true, false)
+		require.NoError(t, err)
+		assert.Greater(t, count, 0, "should create new partitions for today through today+2")
+		t.Logf("created %d new partitions (today + 2 days)", count)
+
+		// Verify via ListAttachedPartitions that dates are extracted from timestamp bounds
+		attached, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		for _, p := range attached {
+			assert.False(t, p.PartitionDate.IsZero(),
+				"partition %s should have a non-zero date (timestamp bounds regex must work)", p.TableName)
+			assert.Greater(t, p.Age, -4,
+				"partition %s age (%d) should be reasonable", p.TableName, p.Age)
+			t.Logf("  %s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		}
+	})
+
+	t.Run("detach partitions older than 100 days", func(t *testing.T) {
+		attachedBefore, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+
+		cutoff := time.Now().AddDate(0, 0, -100)
+		expectedDetach := 0
+		for _, p := range attachedBefore {
+			if p.PartitionDate.Before(cutoff) {
+				expectedDetach++
+			}
+		}
+		require.Greater(t, expectedDetach, 0, "should have partitions older than 100 days")
+
+		detached, err := dbp.DetachOldPartitions(tableName, 100, false)
+		require.NoError(t, err)
+		assert.Equal(t, expectedDetach, detached,
+			"should detach exactly the partitions older than 100 days")
+		t.Logf("detached %d partitions (expected %d)", detached, expectedDetach)
+
+		// Verify remaining attached partitions are all within the retention window
+		attachedAfter, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		for _, p := range attachedAfter {
+			assert.False(t, p.PartitionDate.Before(cutoff),
+				"partition %s (date=%s, age=%d) should not be attached — it predates the 100-day cutoff",
+				p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+		}
+
+		// Verify detached partitions exist
+		detachedList, err := dbp.ListDetachedPartitions(tableName)
+		require.NoError(t, err)
+		assert.Equal(t, expectedDetach, len(detachedList),
+			"all detached partitions should still exist as standalone tables")
+	})
+
+	t.Run("drop detached partitions older than 110 days", func(t *testing.T) {
+		detachedBefore, err := dbp.ListDetachedPartitions(tableName)
+		require.NoError(t, err)
+		require.Greater(t, len(detachedBefore), 0, "should have detached partitions")
+
+		// Count how many detached partitions are older than 110 days (the very old tier)
+		dropCutoff := time.Now().AddDate(0, 0, -110)
+		expectedDrop := 0
+		expectedSurvive := 0
+		for _, p := range detachedBefore {
+			if p.PartitionDate.Before(dropCutoff) {
+				expectedDrop++
+				t.Logf("  will drop: %s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+			} else {
+				expectedSurvive++
+				t.Logf("  will keep: %s date=%s age=%d", p.TableName, p.PartitionDate.Format("2006-01-02"), p.Age)
+			}
+		}
+		require.Greater(t, expectedDrop, 0, "should have detached partitions older than 110 days")
+		require.Greater(t, expectedSurvive, 0, "should have detached partitions newer than 110 days (the 105-day tier)")
+
+		dropped, err := dbp.DropOldDetachedPartitions(tableName, 110, false)
+		require.NoError(t, err)
+		assert.Equal(t, expectedDrop, dropped,
+			"should drop only detached partitions older than 110 days")
+		t.Logf("dropped %d detached partitions (expected %d)", dropped, expectedDrop)
+
+		// Verify the 105-day-old detached partitions still exist
+		detachedAfter, err := dbp.ListDetachedPartitions(tableName)
+		require.NoError(t, err)
+		assert.Equal(t, expectedSurvive, len(detachedAfter),
+			"detached partitions between 100-110 days should survive the drop")
+
+		// Verify the dropped tables no longer exist
+		for _, p := range detachedBefore {
+			if p.PartitionDate.Before(dropCutoff) {
+				assert.False(t, tableExists(t, db, p.TableName),
+					"dropped partition %s should no longer exist", p.TableName)
+			}
+		}
+	})
+
+	t.Run("recent partitions still attached", func(t *testing.T) {
+		attached, err := dbp.ListAttachedPartitions(tableName)
+		require.NoError(t, err)
+		assert.Greater(t, len(attached), 0, "recent partitions should remain attached")
+
+		// All remaining attached partitions should be within the 100-day window
+		cutoff := time.Now().AddDate(0, 0, -100)
+		for _, p := range attached {
+			assert.False(t, p.PartitionDate.Before(cutoff),
+				"attached partition %s (date=%s) should be within retention window",
+				p.TableName, p.PartitionDate.Format("2006-01-02"))
+		}
+
+		// Should have partitions at today+2
+		tomorrow := time.Now().AddDate(0, 0, 1)
+		var hasFuture bool
+		for _, p := range attached {
+			if !p.PartitionDate.Before(tomorrow) {
+				hasFuture = true
+				break
+			}
+		}
+		assert.True(t, hasFuture, "should still have future partitions (today+2)")
+	})
+}
