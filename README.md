@@ -1,25 +1,16 @@
 # gopar - Go PostgreSQL Partition Management
 
-A focused Go library for managing PostgreSQL table partitions and migrating data from existing tables to partitioned ones.
+A Go library and CLI for managing PostgreSQL table partitions, with first-class support for nested LIST -> RANGE partitioning.
 
 ## Features
 
 - **Partition Lifecycle Management**: Create, attach, detach, and drop table partitions
-- **Data Migration**: Migrate data from non-partitioned tables to partitioned tables  
-- **Retention Policies**: Manage partition retention and clean up old data
-- **Foreign Key Analysis**: Analyze and migrate foreign keys for partitioned tables
-- **Schema Verification**: Verify table schemas and column compatibility
-- **Dry-run Mode**: Test operations before applying changes
-
-## What gopar Does NOT Include
-
-Unlike comprehensive database tools, gopar is **focused on partition management and data migration**. It does **NOT** include:
-
-- Schema creation/update from GORM models
-- Creating partitioned tables from scratch
-- Updating table schemas
-
-You should create your partitioned tables using standard DDL or GORM AutoMigrate before using gopar for data migration and partition management.
+- **Nested Partitioning**: Automated LIST -> RANGE partition creation (e.g., partition by release, then by date)
+- **Retention Policies**: Two-phase detach/drop with safety thresholds (90-day minimum, 75% partition count)
+- **Partition Format Detection**: Auto-detect and convert between standard (`_YYYY_MM_DD`) and pg-partman (`_pYYYY_MM_DD`) naming
+- **Pipeline System**: JSON-driven multi-step plans for orchestrating partition operations across tables
+- **SQL Spec Execution**: Run migration/index SQL from JSON spec files with batch and concurrent modes
+- **Dry-run Mode**: Preview all operations before applying changes
 
 ## Installation
 
@@ -40,34 +31,11 @@ make build
 # Binary will be in ./build/gopar
 ```
 
-## Building and Testing
-
-This project includes a comprehensive Makefile for building, testing, and running the CLI:
-
-```bash
-# Show all available targets
-make help
-
-# Build the CLI
-make build
-
-# Run tests
-make test
-
-# Run with example specs
-make run
-
-# Build for all platforms
-make build-all
-```
-
-See [MAKEFILE_USAGE.md](MAKEFILE_USAGE.md) for detailed Makefile documentation.
-
 ## Requirements
 
-- Go 1.20 or later
+- Go 1.24+
 - PostgreSQL 11+ (for native partitioning support)
-- [GORM](https://gorm.io/) v1.20+
+- [lib/pq](https://github.com/lib/pq) PostgreSQL driver (included as a dependency)
 
 ## Usage
 
@@ -75,315 +43,347 @@ See [MAKEFILE_USAGE.md](MAKEFILE_USAGE.md) for detailed Makefile documentation.
 
 ```go
 import (
-    "gorm.io/driver/postgres"
-    "gorm.io/gorm"
-    "github.com/neisw/gopar"
+    "database/sql"
+    _ "github.com/lib/pq"
+    "github.com/neisw/gopar/partitioning"
 )
 
-// Connect to PostgreSQL using GORM
+// Connect to PostgreSQL
 dsn := "host=localhost user=postgres password=postgres dbname=mydb port=5432 sslmode=disable"
-gormDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+db, err := sql.Open("postgres", dsn)
 if err != nil {
     panic(err)
 }
 
-// Wrap with gopar
-db := gopar.New(gormDB)
+// Create partition manager
+dbp := partitioning.NewPartitions(db)
 ```
 
-### Creating Partitions
+### Creating Flat RANGE Partitions
 
 ```go
-// Assume you already have a partitioned table created via DDL:
+// Assume you already have a partitioned table:
 // CREATE TABLE events (...) PARTITION BY RANGE (created_at);
 
-// Create daily partitions for a date range
-startDate := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-endDate := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)
+startDate := time.Now()
+endDate := time.Now().AddDate(0, 0, 3)
 
-created, err := db.CreateMissingPartitions("events", startDate, endDate, false)
-if err != nil {
-    log.Fatalf("Failed to create partitions: %v", err)
-}
+// usePartmanFormat: false for _YYYY_MM_DD, true for _pYYYY_MM_DD
+created, err := dbp.CreateMissingPartitions("events", startDate, endDate, false, false)
 log.Printf("Created %d partitions", created)
 ```
 
-### Migrating to Partitioned Tables
+### Creating Nested LIST -> RANGE Partitions
 
 ```go
-// Step 0: Create the partitioned table first using DDL or GORM
-// CREATE TABLE events_partitioned (...) PARTITION BY RANGE (created_at);
+// Table partitioned by LIST on release, with RANGE sub-partitions by date:
+// CREATE TABLE test_results (...) PARTITION BY LIST (release);
 
-// Step 1: Initial migration (migrate data up to a specific date)
-migrateUpTo := time.Date(2024, 11, 1, 0, 0, 0, 0, time.UTC)
-err := db.MigrateToPartitionedTable("events", "created_at", migrateUpTo, false)
-if err != nil {
-    log.Fatalf("Failed to migrate: %v", err)
-}
+releases := []string{"4.17", "4.18", "4.19"}
+startDate := time.Now().AddDate(0, 0, -100)
+endDate := time.Now().AddDate(0, 0, 2)
 
-// Step 2: Update migration (incrementally catch up)
-migrateUpTo = time.Date(2024, 12, 1, 0, 0, 0, 0, time.UTC)
-err = db.UpdatePartitionedTableMigration("events", "created_at", migrateUpTo, false)
-if err != nil {
-    log.Fatalf("Failed to update migration: %v", err)
-}
+count, err := dbp.CreateMissingPartitionsListToRange(
+    "test_results",
+    releases,
+    startDate,
+    endDate,
+    "date",       // date column name
+    true,         // use partman format
+    false,        // dry run
+)
+// Creates LIST intermediates + daily RANGE leaves:
+// test_results (LIST by release)
+// +-- test_results_4_17 (RANGE by date)
+// |   +-- test_results_4_17_p2026_02_20
+// |   +-- test_results_4_17_p2026_02_21
+// |   +-- ...
+// +-- test_results_4_18 (RANGE by date)
+// |   +-- ...
+// +-- test_results_4_19 (RANGE by date)
+//     +-- ...
+```
 
-// Step 3: Finalize migration (swap tables)
-finalMigrateUpTo := time.Now()
-err = db.FinalizePartitionedTableMigration("events", "created_at", finalMigrateUpTo, true, false)
-if err != nil {
-    log.Fatalf("Failed to finalize migration: %v", err)
-}
+### Querying Partition Hierarchy
+
+```go
+// Get full partition hierarchy
+hierarchy, err := dbp.GetPartitionHierarchy("test_results")
+
+// Get only leaf partitions (those that hold data)
+leaves, err := dbp.ListLeafPartitions("test_results")
+
+// Get daily partitions for a specific release
+v17Parts, err := dbp.GetDailyPartitionsForRelease("test_results", "4.17")
 ```
 
 ### Managing Partition Retention
 
 ```go
+// Preview what would be affected
+summary, err := dbp.GetRetentionSummary("events", 90, true)
+
 // List partitions older than 90 days
-retentionDays := 90
-partitions, err := db.GetPartitionsForRemoval("events", retentionDays, true)
-if err != nil {
-    log.Fatalf("Failed to get partitions: %v", err)
-}
+candidates, err := dbp.GetPartitionsForRemoval("events", 90, true)
 
-// Detach old partitions (safer than dropping)
-count, err := db.DetachOldPartitions("events", retentionDays, false)
-if err != nil {
-    log.Fatalf("Failed to detach partitions: %v", err)
-}
-log.Printf("Detached %d partitions", count)
+// Phase 1: Detach old partitions (keeps them as standalone tables)
+detached, err := dbp.DetachOldPartitions("events", 90, false)
+log.Printf("Detached %d partitions", detached)
 
-// Drop detached partitions
-count, err = db.DropOldDetachedPartitions("events", retentionDays, false)
-if err != nil {
-    log.Fatalf("Failed to drop partitions: %v", err)
-}
-log.Printf("Dropped %d detached partitions", count)
+// Phase 2: Drop previously detached partitions older than 100 days
+dropped, err := dbp.DropOldDetachedPartitions("events", 100, false)
+log.Printf("Dropped %d detached partitions", dropped)
 ```
 
-### Foreign Key Analysis
+### Partition Format Detection and Renaming
 
 ```go
-// Analyze the impact of partitioning a table on foreign keys
-err := db.AnalyzePartitioningImpact("events")
-if err != nil {
-    log.Fatalf("Failed to analyze: %v", err)
+// Detect whether existing partitions use partman naming (_pYYYY_MM_DD)
+isPartman, err := dbp.DetectPartitionFormat("events")
+
+// Rename partitions to match a target format (e.g., after a table swap)
+renamed, err := dbp.RenamePartitionsToMatchConfig(
+    "test_results",
+    releases,
+    true,  // target: partman format
+    false, // dry run
+)
+```
+
+### Dry-run Mode
+
+Most operations support a `dryRun` parameter. When set to `true`, the operation will log what would be executed and return without making changes.
+
+## CLI Usage
+
+The `gopar` CLI provides two main commands:
+
+### `gopar sql` - Execute SQL Specs
+
+Run SQL migration/index specs from JSON files:
+
+```bash
+gopar sql \
+    --dsn "host=localhost user=postgres dbname=mydb" \
+    --spec-file config/specs/prowjobruntests/001_create_indexes.json \
+    --dry-run
+
+# Run specific specs from a file
+gopar sql \
+    --dsn "..." \
+    --spec-file config/specs/example.json \
+    --specs "create_index_a,create_index_b"
+```
+
+SQL spec files are JSON arrays of operations:
+
+```json
+[
+  {
+    "name": "create_index_on_date",
+    "description": "Add index on date column",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_date ON events (date)"
+  }
+]
+```
+
+- `concurrent: true` runs the query outside a transaction (required for `CREATE INDEX CONCURRENTLY`)
+- `concurrent: false` wraps the query in a transaction
+- `batch_size` enables repeated execution for batch backfills
+
+### `gopar manage` - Execute Partition Pipelines
+
+Run multi-step partition management plans from JSON config files:
+
+```bash
+gopar manage \
+    --dsn "host=localhost user=postgres dbname=mydb" \
+    --config config/plans/prowjobruntests.json \
+    --dry-run
+
+# Resume from a specific step
+gopar manage \
+    --dsn "..." \
+    --config config/plans/prowjobruntests_finalize.json \
+    --start-step swap_tables
+```
+
+Plan files define a pipeline of steps:
+
+```json
+{
+  "name": "migration_pipeline",
+  "description": "Migrate tables to LIST->RANGE partitioning",
+  "steps": [
+    {
+      "name": "discover_releases",
+      "type": "query_releases",
+      "query": "SELECT DISTINCT release FROM releases ORDER BY release",
+      "store_as": "releases"
+    },
+    {
+      "name": "create_partitions",
+      "type": "create_partitions_list_to_range",
+      "table": "test_results_new",
+      "releases_from": "releases",
+      "date_column": "date",
+      "start_date": {"relative": "-100d"},
+      "end_date": {"relative": "+2d"},
+      "use_partman_format": true
+    },
+    {
+      "name": "run_migration_sql",
+      "type": "sql_specs",
+      "spec_file": "config/specs/004_migrate_data.json"
+    },
+    {
+      "name": "rename_partitions",
+      "type": "rename_partitions",
+      "table": "test_results",
+      "releases_from": "releases",
+      "use_partman_format": true
+    }
+  ]
 }
+```
+
+**Available step types:**
+
+| Type | Description |
+|------|-------------|
+| `query_releases` | Run a SQL query and store results as a variable |
+| `sql_specs` | Execute a SQL spec file |
+| `create_partitions_list_to_range` | Create nested LIST -> RANGE partitions |
+| `create_partitions_range` | Create flat RANGE partitions |
+| `rename_partitions` | Rename partitions to match naming config |
+| `detach_old_partitions` | Detach partitions older than retention period |
+| `drop_old_detached` | Drop previously detached partitions |
+
+### Global Flags
+
+```
+--log-level string   Log level: trace, debug, info, warn, error (default "info")
+--dsn string         PostgreSQL connection string
+--dry-run            Preview operations without executing
 ```
 
 ## Key Concepts
 
-### Daily Partitions
+### Partition Naming
 
-The library assumes daily partitions with the naming convention: `tablename_YYYY_MM_DD`
+gopar supports two naming conventions and auto-detects which is in use:
 
-For example:
-- `events_2024_01_01`
-- `events_2024_01_02`
-- etc.
+| Format | Example | When to use |
+|--------|---------|-------------|
+| Standard | `events_2024_01_15` | Default for new tables |
+| pg-partman | `events_p2024_01_15` | Compatibility with pg_partman-managed tables |
 
-### Nested (Multi-level) Partitioning
+Names that would exceed PostgreSQL's 63-character identifier limit are automatically shortened with an FNV hash suffix.
 
-gopar supports nested partitioning where partitions are themselves partitioned. Common patterns:
+### Safety Thresholds
 
-**LIST → RANGE (Release/Daily Pattern)**
+Retention operations enforce safety guards:
+- **90-day minimum retention** - cannot detach partitions younger than 90 days
+- **75% partition count threshold** - refuses to detach more than 75% of partitions
+- **Two-phase cleanup** - detach first, drop separately, providing a recovery window
 
-Partition by release version, then by date within each release:
+### Nested Partitioning
 
-```go
-// Create nested partitions: LIST by release → RANGE by date
-releases := []string{"v1.0", "v2.0", "v3.0"}
-startDate := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-endDate := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)
+For LIST -> RANGE tables, the partition hierarchy has three levels:
 
-count, err := db.CreateMissingPartitionsListToRange(
-    "events",
-    releases,
-    startDate,
-    endDate,
-    "event_date",
-    false,
-)
-// Creates: 3 intermediate partitions + 1,095 daily leaf partitions
-// Structure:
-// events (LIST by release_name)
-// ├── events_v1_0 (RANGE by event_date)
-// │   ├── events_v1_0_2024_01_01
-// │   ├── events_v1_0_2024_01_02
-// │   └── ... (365 partitions)
-// ├── events_v2_0 (RANGE by event_date)
-// │   └── ... (365 partitions)
-// └── events_v3_0 (RANGE by event_date)
-//     └── ... (365 partitions)
+```
+parent_table (LIST by release)
++-- parent_table_4_17 (RANGE by date)    <- intermediate
+|   +-- parent_table_4_17_p2026_01_01    <- leaf (holds data)
+|   +-- parent_table_4_17_p2026_01_02
++-- parent_table_4_18 (RANGE by date)
+    +-- parent_table_4_18_p2026_01_01
 ```
 
-**Querying Nested Partitions**
+**Primary key requirement**: Must include all partition key columns.
 
-```go
-// Get full partition hierarchy
-hierarchy, err := db.GetPartitionHierarchy("events")
-
-// Get only leaf partitions (those that hold data)
-leaves, err := db.ListLeafPartitions("events")
-
-// Get all daily partitions for a specific release
-v1Partitions, err := db.GetDailyPartitionsForRelease("events", "v1.0")
+```sql
+PRIMARY KEY (id, release, date)
 ```
 
-**Nested Partition Retention**
+## API Reference
 
-```go
-// Option 1: Drop entire release (intermediate + all children)
-err := db.DetachPartition("events_v1_0", false)
-err = db.DropPartition("events_v1_0", false)
+### Types
 
-// Option 2: Different retention per release
-retentionByRelease := map[string]int{
-    "v1.0": 30,  // Keep 30 days
-    "v2.0": 90,  // Keep 90 days
-    "v3.0": 0,   // Keep forever
-}
+- `DB_PARTITIONS` - Main partition manager, created via `partitioning.NewPartitions(db)`
+- `PartitionInfo` - Metadata about a single partition (name, date, age, size, row estimate)
+- `PartitionedTableInfo` - Metadata about a partitioned parent table
+- `PartitionStats` - Aggregate statistics (total partitions, size, date range)
+- `RetentionSummary` - Preview of retention policy impact
+- `PartitionHierarchyInfo` - Partition metadata within a nested hierarchy
 
-for release, days := range retentionByRelease {
-    if days == 0 {
-        continue
-    }
-    
-    partitions, _ := db.GetDailyPartitionsForRelease("events", release)
-    cutoff := time.Now().AddDate(0, 0, -days)
-    
-    for _, p := range partitions {
-        if p.PartitionDate != nil && p.PartitionDate.Before(cutoff) {
-            db.DetachPartition(p.TableName, false)
-        }
-    }
-}
+### Methods on DB_PARTITIONS
+
+#### Partition Discovery
+- `ListPartitionedTables()` - List all partitioned tables in the database
+- `ListTablePartitions(tableName)` - List all partitions for a table
+- `ListAttachedPartitions(tableName)` - List currently attached partitions
+- `ListDetachedPartitions(tableName)` - List detached (standalone) partitions
+- `IsPartitionAttached(partitionName)` - Check if a partition is attached to its parent
+- `GetPartitionColumns(tableName)` - Get partition key columns
+
+#### Partition Creation
+- `CreateMissingPartitions(tableName, startDate, endDate, usePartmanFormat, dryRun)` - Create daily RANGE partitions
+- `CreateMissingPartitionsListToRange(tableName, releases, startDate, endDate, dateColumn, usePartmanFormat, dryRun)` - Create nested LIST -> RANGE partitions
+- `AttachPartition(tableName, partitionName, usePartmanFormat, dryRun)` - Attach a detached partition
+
+#### Partition Removal
+- `DetachPartition(partitionName, dryRun)` - Detach a single partition
+- `DetachOldPartitions(tableName, retentionDays, dryRun)` - Detach all partitions older than retention period
+- `DropPartition(partitionName, dryRun)` - Drop a single partition
+- `DropOldDetachedPartitions(tableName, retentionDays, dryRun)` - Drop detached partitions older than retention period
+
+#### Statistics & Retention
+- `GetPartitionStats(tableName)` - Aggregate stats for all partitions
+- `GetAttachedPartitionStats(tableName)` - Stats for attached partitions only
+- `GetDetachedPartitionStats(tableName)` - Stats for detached partitions only
+- `GetPartitionsForRemoval(tableName, retentionDays, attachedOnly)` - List partitions eligible for removal
+- `GetRetentionSummary(tableName, retentionDays, attachedOnly)` - Preview retention policy impact
+- `ValidateRetentionPolicy(tableName, retentionDays)` - Validate safety thresholds
+
+#### Nested Partition Operations
+- `GetPartitionHierarchy(tableName)` - Get complete partition tree
+- `ListLeafPartitions(tableName)` - Get only leaf partitions (those holding data)
+- `GetPartitionLevel(partitionName)` - Get nesting depth of a partition
+- `GetDailyPartitionsForRelease(tableName, release)` - Get daily partitions for one release
+
+#### Partition Naming
+- `DetectPartitionFormat(tableName)` - Returns true if partitions use pg-partman naming
+- `RenamePartitionsToMatchConfig(tableName, releases, usePartmanFormat, dryRun)` - Rename partitions to target format
+
+## Building and Testing
+
+```bash
+make help          # Show all targets
+make build         # Build CLI binary
+make test          # Run tests
+make test-unit     # Run unit tests only (no database)
+make e2e           # Run e2e tests (starts PostgreSQL container)
+make run           # Build and run with example spec (dry-run)
+make build-all     # Build for Linux, macOS, Windows
 ```
 
-**Important Notes for Nested Partitioning:**
-
-1. **Primary Key Requirements**: Must include all partition keys
-   ```sql
-   -- For LIST → RANGE partitioning
-   PRIMARY KEY (id, release_name, event_date)
-   ```
-
-2. **Partition Pruning**: Queries benefit from multi-level pruning
-   ```sql
-   -- Single partition scan
-   WHERE release_name = 'v1.0' AND event_date = '2024-01-15'
-   -- Only scans: events_v1_0_2024_01_15
-   ```
-
-3. **Supported Combinations**: LIST→RANGE, RANGE→LIST, RANGE→RANGE, LIST→LIST, HASH combinations
-
-### Dry-run Mode
-
-Most operations support a `dryRun` parameter. When set to `true`, the operation will:
-- Validate the operation
-- Log what would be executed
-- Return without making any changes
-
-### Foreign Keys on Partitioned Tables
-
-PostgreSQL has restrictions on foreign keys with partitioned tables:
-
-- **Outbound FKs** (partitioned table → non-partitioned table): Allowed ✅
-- **Outbound FKs** (partitioned table → partitioned table): Not supported ❌
-- **Inbound FKs** (non-partitioned table → partitioned table): Requires expanding FK to include partition key
-
-gopar provides utilities to analyze and handle these cases during migrations.
-
-## API Documentation
-
-### Main Types
-
-- `DB`: Main database wrapper providing all partition management methods
-- `PartitionInfo`: Metadata about a partition
-- `PartitionStats`: Aggregate statistics about partitions
-- `RetentionSummary`: Summary of retention policy impact
-- `PartitionHierarchyInfo`: Metadata about a partition in a nested hierarchy
-- `PartitionLevel`: Depth in partition hierarchy (0=root, 1=first level, etc.)
-- `MultiLevelPartitionConfig`: Configuration for multi-level partitioning
-
-### Key Methods
-
-#### Partition Management
-- `CreateMissingPartitions()`: Create partitions for a date range
-- `ListPartitionedTables()`: List all partitioned tables
-- `ListTablePartitions()`: List partitions for a table
-- `ListAttachedPartitions()`: List currently attached partitions
-- `ListDetachedPartitions()`: List detached partitions
-- `AttachPartition()`: Attach a detached partition
-- `DetachPartition()`: Detach a partition (safer than dropping)
-- `DropPartition()`: Drop a partition permanently
-
-#### Nested Partition Management
-- `CreateMissingPartitionsListToRange()`: Create LIST→RANGE nested partitions
-- `GetPartitionHierarchy()`: Get complete partition hierarchy with all levels
-- `ListLeafPartitions()`: Get only leaf partitions (those holding data)
-- `GetPartitionLevel()`: Get the nesting level of a specific partition
-- `GetDailyPartitionsForRelease()`: Get daily partitions for a specific release
-- `IsPartitionAttached()`: Check if partition is attached to parent
-
-#### Migration
-- `MigrateToPartitionedTable()`: Initial migration to partitioned table (table must exist)
-- `UpdatePartitionedTableMigration()`: Incremental migration update
-- `FinalizePartitionedTableMigration()`: Finalize migration and swap tables
-- `MigrateTableData()`: Migrate all data between tables
-- `MigrateTableDataRange()`: Migrate data for a specific date range
-
-#### Foreign Keys
-- `AnalyzePartitioningImpact()`: Analyze FK impact of partitioning
-- `GetFKRelationships()`: Get all FK relationships for a table
-- `MoveForeignKeys()`: Move FKs when swapping tables
-
-#### Retention Management
-- `GetPartitionsForRemoval()`: List partitions older than retention period
-- `GetRetentionSummary()`: Summary of retention policy impact
-- `ValidateRetentionPolicy()`: Validate retention policy safety
-- `DetachOldPartitions()`: Detach old partitions
-- `DropOldDetachedPartitions()`: Drop detached partitions
-
-#### Utilities
-- `GetTableColumns()`: Get column information
-- `VerifyTablesHaveSameColumns()`: Verify schema compatibility
-- `GetTableRowCount()`: Get row count for a table
-- `RenameTables()`: Atomically rename multiple tables
-- `SyncIdentityColumn()`: Sync IDENTITY sequence after migration
-- `GetPartitionStrategy()`: Get partition strategy for a table
-- `VerifyPartitionCoverage()`: Verify partitions exist for date range
-
-## Comparison with gorp
-
-**gopar** is a focused subset of [gorp](https://github.com/neisw/gorp):
-
-| Feature | gopar | gorp |
-|---------|-------|------|
-| Create partitioned tables from GORM models | ❌ | ✅ |
-| Update table schemas | ❌ | ✅ |
-| Partition lifecycle management | ✅ | ✅ |
-| Data migration | ✅ | ✅ |
-| Foreign key analysis | ✅ | ✅ |
-| Retention policies | ✅ | ✅ |
-
-**Use gopar when**: You want a lightweight library focused only on partition management and data migration, and you're comfortable creating table schemas yourself.
-
-**Use gorp when**: You want comprehensive database utilities including schema creation/updates from GORM models.
+See [MAKEFILE_USAGE.md](MAKEFILE_USAGE.md) for detailed Makefile documentation.
 
 ## Testing
 
-Run tests with:
-
 ```bash
-go test -v
+# Unit tests (no database required)
+make test-unit
+
+# E2E tests with containerized PostgreSQL
+make e2e
+
+# Integration tests against an external database
+GOPAR_DSN="host=localhost user=postgres dbname=mydb" \
+    go test -v ./test/integration/...
 ```
-
-**Note**: Integration tests require a PostgreSQL database connection.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
@@ -391,6 +391,5 @@ Apache License 2.0
 
 ## Related Projects
 
-- [gorp](https://github.com/neisw/gorp) - Comprehensive PostgreSQL partition management with schema creation
-- [GORM](https://gorm.io/) - The ORM library used by gopar
+- [pg_partman](https://github.com/pgpartman/pg_partman) - PostgreSQL extension for automated partition management (see [comparison](docs/gopar-vs-pgpartman.md))
 - [lib/pq](https://github.com/lib/pq) - PostgreSQL driver for Go
