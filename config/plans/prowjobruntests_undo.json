@@ -1,0 +1,38 @@
+{
+  "name": "prowjobruntests_undo",
+  "description": "Undo finalize phase: reverse table swap, restore _old tables to production names, rename partitions back to _new for prow_job_run_tests, prow_job_run_test_outputs, and test_analysis_by_job_by_dates",
+  "steps": [
+    {
+      "name": "discover_releases",
+      "type": "query_releases",
+      "query": "SELECT DISTINCT release FROM prow_jobs ORDER BY release",
+      "store_as": "releases"
+    },
+    {
+      "name": "undo_swap_tables",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests_undo/001_undo_swap_partitioned_tables.json"
+    },
+    {
+      "name": "rename_prow_job_run_tests_new_partitions",
+      "type": "rename_partitions",
+      "table": "prow_job_run_tests_new",
+      "releases_from": "releases",
+      "use_partman_format": true
+    },
+    {
+      "name": "rename_prow_job_run_test_outputs_new_partitions",
+      "type": "rename_partitions",
+      "table": "prow_job_run_test_outputs_new",
+      "releases_from": "releases",
+      "use_partman_format": true
+    },
+    {
+      "name": "rename_test_analysis_new_partitions",
+      "type": "rename_partitions",
+      "table": "test_analysis_by_job_by_dates_new",
+      "releases_from": "releases",
+      "use_partman_format": true
+    }
+  ]
+}
