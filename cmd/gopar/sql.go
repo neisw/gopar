@@ -199,11 +199,13 @@ func executeBatchSpec(db *sql.DB, spec SQLSpec, start time.Time) error {
 			if txErr != nil {
 				return fmt.Errorf("batch %d failed to begin transaction: %w", batchNum, txErr)
 			}
-			defer tx.Rollback()
 
 			result, err = tx.Exec(spec.Query, spec.BatchSize)
 			if err == nil {
 				err = tx.Commit()
+			}
+			if err != nil {
+				tx.Rollback()
 			}
 		}
 

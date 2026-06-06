@@ -1,0 +1,20 @@
+[
+  {
+    "name": "backfill_prow_job_run_tests",
+    "description": "Backfill rows from prow_job_run_tests missing in _new table for the last 14 days by business timestamp",
+    "concurrent": true,
+    "query": "INSERT INTO prow_job_run_tests_new (id, created_at, updated_at, deleted_at, prow_job_run_id, prow_job_id, prow_job_run_timestamp, prow_job_run_release, test_id, suite_id, status, duration) SELECT o.id, o.created_at, o.updated_at, o.deleted_at, o.prow_job_run_id, o.prow_job_id, o.prow_job_run_timestamp, o.prow_job_run_release, o.test_id, o.suite_id, o.status, o.duration FROM prow_job_run_tests o LEFT JOIN prow_job_run_tests_new n ON o.id = n.id AND o.prow_job_run_release = n.prow_job_run_release AND o.prow_job_run_timestamp = n.prow_job_run_timestamp WHERE o.prow_job_run_timestamp >= NOW() - INTERVAL '14 days' AND n.id IS NULL ORDER BY o.created_at, o.id"
+  },
+  {
+    "name": "backfill_prow_job_run_test_outputs",
+    "description": "Backfill rows from prow_job_run_test_outputs missing in _new table for the last 14 days by business timestamp",
+    "concurrent": true,
+    "query": "INSERT INTO prow_job_run_test_outputs_new (id, created_at, updated_at, deleted_at, prow_job_run_test_id, output, prow_job_run_test_timestamp, prow_job_run_test_release) SELECT o.id, o.created_at, o.updated_at, o.deleted_at, o.prow_job_run_test_id, o.output, o.prow_job_run_test_timestamp, o.prow_job_run_test_release FROM prow_job_run_test_outputs o LEFT JOIN prow_job_run_test_outputs_new n ON o.id = n.id AND o.prow_job_run_test_release = n.prow_job_run_test_release AND o.prow_job_run_test_timestamp = n.prow_job_run_test_timestamp WHERE o.prow_job_run_test_timestamp >= NOW() - INTERVAL '14 days' AND n.id IS NULL ORDER BY o.created_at, o.id"
+  },
+  {
+    "name": "backfill_test_analysis_by_job_by_dates",
+    "description": "Backfill rows from test_analysis_by_job_by_dates missing in _new table for the last 14 days",
+    "concurrent": true,
+    "query": "INSERT INTO test_analysis_by_job_by_dates_new (date, test_id, release, job_name, test_name, runs, passes, flakes, failures) SELECT o.date, o.test_id, o.release, o.job_name, o.test_name, o.runs, o.passes, o.flakes, o.failures FROM test_analysis_by_job_by_dates o LEFT JOIN test_analysis_by_job_by_dates_new n ON o.date = n.date AND o.test_id = n.test_id AND o.release = n.release AND o.job_name = n.job_name WHERE o.date >= NOW() - INTERVAL '14 days' AND n.date IS NULL ORDER BY o.date"
+  }
+]
