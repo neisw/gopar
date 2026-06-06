@@ -1,0 +1,8 @@
+[
+  {
+    "name": "rename_partitions_remove_new",
+    "description": "After table swap, rename all partitions of prow_job_run_tests and prow_job_run_test_outputs to remove the '_new' prefix",
+    "concurrent": false,
+    "query": "DO $$ DECLARE parent_tables text[] := ARRAY['prow_job_run_tests', 'prow_job_run_test_outputs']; tbl text; old_prefix text; r RECORD; new_name text; BEGIN FOREACH tbl IN ARRAY parent_tables LOOP old_prefix := tbl || '_new'; FOR r IN WITH RECURSIVE partition_tree AS ( SELECT c.oid, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = tbl AND n.nspname = 'public' UNION ALL SELECT child.oid, child.relname FROM pg_inherits i JOIN pg_class child ON child.oid = i.inhrelid JOIN partition_tree pt ON pt.oid = i.inhparent ) SELECT relname FROM partition_tree WHERE relname != tbl AND relname LIKE old_prefix || '%' ORDER BY length(relname) DESC LOOP new_name := tbl || substring(r.relname FROM length(old_prefix) + 1); EXECUTE format('ALTER TABLE %I RENAME TO %I', r.relname, new_name); RAISE NOTICE 'Renamed % to %', r.relname, new_name; END LOOP; END LOOP; END $$"
+  }
+]

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "drop_idx_prow_job_runs_release_timestamp",
+    "description": "Drop index on prow_job_runs for release and timestamp queries",
+    "concurrent": true,
+    "query": "DROP INDEX CONCURRENTLY IF EXISTS idx_prow_job_runs_release_timestamp"
+  },
+  {
+    "name": "drop_idx_prow_job_run_tests_prow_job_id",
+    "description": "Drop index on prow_job_run_tests for prow_job_id lookups",
+    "concurrent": true,
+    "query": "DROP INDEX CONCURRENTLY IF EXISTS idx_prow_job_run_tests_prow_job_id"
+  },
+  {
+    "name": "drop_idx_prow_job_run_tests_release_timestamp",
+    "description": "Drop index on prow_job_run_tests for release and timestamp queries",
+    "concurrent": true,
+    "query": "DROP INDEX CONCURRENTLY IF EXISTS idx_prow_job_run_tests_release_timestamp"
+  },
+  {
+    "name": "drop_idx_prow_job_run_test_outputs_release_timestamp",
+    "description": "Drop index on prow_job_run_test_outputs for release and timestamp queries",
+    "concurrent": true,
+    "query": "DROP INDEX CONCURRENTLY IF EXISTS idx_prow_job_run_test_outputs_release_timestamp"
+  },
+  {
+    "name": "drop_idx_prow_job_run_prow_pull_requests_release_timestamp",
+    "description": "Drop index on prow_job_run_prow_pull_requests for release and timestamp queries",
+    "concurrent": true,
+    "query": "DROP INDEX CONCURRENTLY IF EXISTS idx_prow_job_run_prow_pull_requests_release_timestamp"
+  },
+  {
+    "name": "drop_idx_prow_job_run_annotations_release_timestamp",
+    "description": "Drop index on prow_job_run_annotations for release and timestamp queries",
+    "concurrent": true,
+    "query": "DROP INDEX CONCURRENTLY IF EXISTS idx_prow_job_run_annotations_release_timestamp"
+  }
+]

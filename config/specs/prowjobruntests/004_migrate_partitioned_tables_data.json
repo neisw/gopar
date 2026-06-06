@@ -1,0 +1,20 @@
+[
+  {
+    "name": "migrate_prow_job_run_tests_data",
+    "description": "Idempotent incremental migration of prow_job_run_tests to prow_job_run_tests_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_created_at TIMESTAMP;\nBEGIN\n\tSELECT MAX(created_at) INTO max_created_at FROM prow_job_run_tests_new;\n\tRAISE NOTICE 'Migrating prow_job_run_tests with created_at > %', COALESCE(max_created_at, '-infinity'::timestamp);\n\tINSERT INTO prow_job_run_tests_new (\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_id, prow_job_id, prow_job_run_timestamp,\n\t\tprow_job_run_release, test_id, suite_id, status, duration\n\t)\n\tSELECT\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_id, prow_job_id, prow_job_run_timestamp,\n\t\tprow_job_run_release, test_id, suite_id, status, duration\n\tFROM prow_job_run_tests\n\tWHERE created_at > COALESCE(max_created_at, '-infinity'::timestamp)\n\tORDER BY created_at, id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  },
+  {
+    "name": "migrate_prow_job_run_test_outputs_data",
+    "description": "Idempotent incremental migration of prow_job_run_test_outputs to prow_job_run_test_outputs_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_created_at TIMESTAMP;\nBEGIN\n\tSELECT MAX(created_at) INTO max_created_at FROM prow_job_run_test_outputs_new;\n\tRAISE NOTICE 'Migrating prow_job_run_test_outputs with created_at > %', COALESCE(max_created_at, '-infinity'::timestamp);\n\tINSERT INTO prow_job_run_test_outputs_new (\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_test_id, output,\n\t\tprow_job_run_test_timestamp, prow_job_run_test_release\n\t)\n\tSELECT\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_test_id, output,\n\t\tprow_job_run_test_timestamp, prow_job_run_test_release\n\tFROM prow_job_run_test_outputs\n\tWHERE created_at > COALESCE(max_created_at, '-infinity'::timestamp)\n\tORDER BY created_at, id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  },
+  {
+    "name": "migrate_test_analysis_by_job_by_dates_data",
+    "description": "Incremental migration of test_analysis_by_job_by_dates to test_analysis_by_job_by_dates_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_date TIMESTAMP WITH TIME ZONE;\nBEGIN\n\tSELECT MAX(date) INTO max_date FROM test_analysis_by_job_by_dates_new;\n\tRAISE NOTICE 'Migrating test_analysis_by_job_by_dates with date > %', COALESCE(max_date, '-infinity'::timestamptz);\n\tINSERT INTO test_analysis_by_job_by_dates_new (\n\t\tdate, test_id, release, job_name, test_name,\n\t\truns, passes, flakes, failures\n\t)\n\tSELECT\n\t\tdate, test_id, release, job_name, test_name,\n\t\truns, passes, flakes, failures\n\tFROM test_analysis_by_job_by_dates\n\tWHERE date > COALESCE(max_date, '-infinity'::timestamptz)\n\tORDER BY date;\n\tRAISE NOTICE 'Migration complete';\nEND $$"
+  }
+]

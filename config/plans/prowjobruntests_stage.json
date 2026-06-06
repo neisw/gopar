@@ -1,0 +1,57 @@
+{
+  "name": "prowjobruntests_stage",
+  "description": "Stage phase: Create partitioned tables, partitions, migrate data, and sync sequences for prow_job_run_tests, prow_job_run_test_outputs, and test_analysis_by_job_by_dates",
+  "steps": [
+    {
+      "name": "discover_releases",
+      "type": "query_releases",
+      "query": "SELECT DISTINCT release FROM prow_jobs ORDER BY release",
+      "store_as": "releases"
+    },
+    {
+      "name": "create_partitioned_tables",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests/003_create_partitioned_tables.json"
+    },
+    {
+      "name": "create_prow_job_run_tests_partitions",
+      "type": "create_partitions_list_to_range",
+      "table": "prow_job_run_tests_new",
+      "releases_from": "releases",
+      "date_column": "prow_job_run_timestamp",
+      "start_date": {"relative": "-100d"},
+      "end_date": {"relative": "+2d"},
+      "use_partman_format": true
+    },
+    {
+      "name": "create_prow_job_run_test_outputs_partitions",
+      "type": "create_partitions_list_to_range",
+      "table": "prow_job_run_test_outputs_new",
+      "releases_from": "releases",
+      "date_column": "prow_job_run_test_timestamp",
+      "start_date": {"relative": "-100d"},
+      "end_date": {"relative": "+2d"},
+      "use_partman_format": true
+    },
+    {
+      "name": "create_test_analysis_partitions",
+      "type": "create_partitions_list_to_range",
+      "table": "test_analysis_by_job_by_dates_new",
+      "releases_from": "releases",
+      "date_column": "date",
+      "start_date": {"relative": "-105d"},
+      "end_date": {"relative": "+2d"},
+      "use_partman_format": true
+    },
+    {
+      "name": "migrate_data",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests/004_migrate_partitioned_tables_data.json"
+    },
+    {
+      "name": "sync_sequences",
+      "type": "sql_specs",
+      "spec_file": "config/specs/prowjobruntests/005_sync_sequences.json"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+[
+  {
+    "name": "create_example_table",
+    "description": "Create example table for testing",
+    "query": "CREATE TABLE IF NOT EXISTS example_table (id BIGINT PRIMARY KEY, created_at TIMESTAMP WITH TIME ZONE, status TEXT)",
+    "concurrent": false
+  }
+]

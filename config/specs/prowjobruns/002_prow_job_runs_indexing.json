@@ -1,0 +1,38 @@
+[
+  {
+    "name": "idx_prow_job_runs_release_timestamp",
+    "description": "Index on prow_job_runs for release and timestamp queries",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_prow_job_runs_release_timestamp\n\t\t\t\t\tON prow_job_runs (prow_job_release, \"timestamp\")"
+  },
+  {
+    "name": "idx_prow_job_run_tests_prow_job_id",
+    "description": "Index on prow_job_run_tests for prow_job_id lookups",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_prow_job_run_tests_prow_job_id\n\t\t\t\t\tON prow_job_run_tests (prow_job_id)"
+  },
+  {
+    "name": "idx_prow_job_run_tests_release_timestamp",
+    "description": "Index on prow_job_run_tests for release and timestamp queries",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_prow_job_run_tests_release_timestamp\n\t\t\t\t\tON prow_job_run_tests (prow_job_run_timestamp, prow_job_run_release)"
+  },
+  {
+    "name": "idx_prow_job_run_test_outputs_release_timestamp",
+    "description": "Index on prow_job_run_test_outputs for release and timestamp queries",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_prow_job_run_test_outputs_release_timestamp\n\t\t\t\t\tON prow_job_run_test_outputs (prow_job_run_test_timestamp, prow_job_run_test_release)"
+  },
+  {
+    "name": "idx_prow_job_run_prow_pull_requests_release_timestamp",
+    "description": "Index on prow_job_run_prow_pull_requests for release and timestamp queries",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_prow_job_run_prow_pull_requests_release_timestamp\n\t\t\t\t\tON prow_job_run_prow_pull_requests (prow_job_run_release, prow_job_run_timestamp)"
+  },
+  {
+    "name": "idx_prow_job_run_annotations_release_timestamp",
+    "description": "Index on prow_job_run_annotations for release and timestamp queries",
+    "concurrent": true,
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_prow_job_run_annotations_release_timestamp\n\t\t\t\t\tON prow_job_run_annotations (prow_job_run_release, prow_job_run_timestamp)"
+  }
+]

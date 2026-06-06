@@ -1,0 +1,32 @@
+[
+  {
+    "name": "migrate_prow_job_runs_data",
+    "description": "Idempotent incremental migration of prow_job_runs to prow_job_runs_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_created_at TIMESTAMP;\nBEGIN\n\tSELECT MAX(created_at) INTO max_created_at FROM prow_job_runs_new;\n\tRAISE NOTICE 'Migrating prow_job_runs with created_at > %', COALESCE(max_created_at, '-infinity'::timestamp);\n\tINSERT INTO prow_job_runs_new (\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_id, prow_job_release, cluster, gcs_bucket, url,\n\t\ttest_failures, failed, infrastructure_failure, known_failure,\n\t\tsucceeded, timestamp, duration, overall_result, labels\n\t)\n\tSELECT\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_id, prow_job_release, cluster, gcs_bucket, url,\n\t\ttest_failures, failed, infrastructure_failure, known_failure,\n\t\tsucceeded, timestamp, duration, overall_result, labels\n\tFROM prow_job_runs\n\tWHERE created_at > COALESCE(max_created_at, '-infinity'::timestamp)\n\tORDER BY created_at, id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  },
+  {
+    "name": "migrate_prow_job_run_annotations_data",
+    "description": "Idempotent incremental migration of prow_job_run_annotations to prow_job_run_annotations_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_created_at TIMESTAMP;\nBEGIN\n\tSELECT MAX(created_at) INTO max_created_at FROM prow_job_run_annotations_new;\n\tRAISE NOTICE 'Migrating prow_job_run_annotations with created_at > %', COALESCE(max_created_at, '-infinity'::timestamp);\n\tINSERT INTO prow_job_run_annotations_new (\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_id, key, value,\n\t\tprow_job_run_release, prow_job_run_timestamp\n\t)\n\tSELECT\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_id, key, value,\n\t\tprow_job_run_release, prow_job_run_timestamp\n\tFROM prow_job_run_annotations\n\tWHERE created_at > COALESCE(max_created_at, '-infinity'::timestamp)\n\tORDER BY created_at, id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  },
+  {
+    "name": "migrate_prow_job_run_prow_pull_requests_data",
+    "description": "Idempotent incremental migration of prow_job_run_prow_pull_requests to prow_job_run_prow_pull_requests_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_timestamp TIMESTAMP;\nBEGIN\n\tSELECT MAX(prow_job_run_timestamp) INTO max_timestamp FROM prow_job_run_prow_pull_requests_new;\n\tRAISE NOTICE 'Migrating prow_job_run_prow_pull_requests with prow_job_run_timestamp > %', COALESCE(max_timestamp, '-infinity'::timestamp);\n\tINSERT INTO prow_job_run_prow_pull_requests_new (\n\t\tprow_job_run_id, prow_pull_request_id,\n\t\tprow_job_run_release, prow_job_run_timestamp\n\t)\n\tSELECT\n\t\tprow_job_run_id, prow_pull_request_id,\n\t\tprow_job_run_release, prow_job_run_timestamp\n\tFROM prow_job_run_prow_pull_requests\n\tWHERE prow_job_run_timestamp > COALESCE(max_timestamp, '-infinity'::timestamp)\n\tORDER BY prow_job_run_timestamp, prow_job_run_id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  },
+  {
+    "name": "migrate_prow_job_run_tests_data",
+    "description": "Idempotent incremental migration of prow_job_run_tests to prow_job_run_tests_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_created_at TIMESTAMP;\nBEGIN\n\tSELECT MAX(created_at) INTO max_created_at FROM prow_job_run_tests_new;\n\tRAISE NOTICE 'Migrating prow_job_run_tests with created_at > %', COALESCE(max_created_at, '-infinity'::timestamp);\n\tINSERT INTO prow_job_run_tests_new (\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_id, prow_job_id, prow_job_run_timestamp,\n\t\tprow_job_run_release, test_id, suite_id, status, duration\n\t)\n\tSELECT\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_id, prow_job_id, prow_job_run_timestamp,\n\t\tprow_job_run_release, test_id, suite_id, status, duration\n\tFROM prow_job_run_tests\n\tWHERE created_at > COALESCE(max_created_at, '-infinity'::timestamp)\n\tORDER BY created_at, id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  },
+  {
+    "name": "migrate_prow_job_run_test_outputs_data",
+    "description": "Idempotent incremental migration of prow_job_run_test_outputs to prow_job_run_test_outputs_new",
+    "concurrent": true,
+    "query": "DO $$\nDECLARE\n\tmax_created_at TIMESTAMP;\nBEGIN\n\tSELECT MAX(created_at) INTO max_created_at FROM prow_job_run_test_outputs_new;\n\tRAISE NOTICE 'Migrating prow_job_run_test_outputs with created_at > %', COALESCE(max_created_at, '-infinity'::timestamp);\n\tINSERT INTO prow_job_run_test_outputs_new (\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_test_id, output,\n\t\tprow_job_run_test_timestamp, prow_job_run_test_release\n\t)\n\tSELECT\n\t\tid, created_at, updated_at, deleted_at,\n\t\tprow_job_run_test_id, output,\n\t\tprow_job_run_test_timestamp, prow_job_run_test_release\n\tFROM prow_job_run_test_outputs\n\tWHERE created_at > COALESCE(max_created_at, '-infinity'::timestamp)\n\tORDER BY created_at, id;\n\tRAISE NOTICE 'Migrated % rows', FOUND;\nEND $$"
+  }
+]

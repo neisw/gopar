@@ -1,0 +1,6 @@
+[
+  {
+    "name": "idx_example_created_at",
+    "query": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_example_created_at ON example_table (created_at)"
+  }
+]
