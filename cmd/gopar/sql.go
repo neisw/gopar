@@ -24,6 +24,10 @@ type SQLSpec struct {
 	// When BatchSize > 0, the query will be executed repeatedly with $1 parameter
 	// until no rows are affected. This is used for batch backfill operations.
 	BatchSize int64
+	// ResultType controls how the query is executed:
+	//   "" or "exec" (default) - uses db.Exec, suitable for DDL/DML statements
+	//   "query" - uses db.Query and prints returned rows, suitable for SELECT validation queries
+	ResultType string
 }
 
 var (
@@ -93,6 +97,9 @@ func runSQL(cmd *cobra.Command, args []string) error {
 					fmt.Printf("Description: %s\n", spec.Description)
 				}
 				fmt.Printf("Concurrent: %v\n", spec.Concurrent)
+				if spec.ResultType != "" {
+					fmt.Printf("ResultType: %s\n", spec.ResultType)
+				}
 				fmt.Printf("Query:\n%s\n", spec.Query)
 			}
 		}
@@ -144,6 +151,10 @@ func executeSpec(db *sql.DB, spec SQLSpec) error {
 		log.Infof("  Description: %s", spec.Description)
 	}
 
+	if spec.ResultType == "query" {
+		return executeQuerySpec(db, spec, start)
+	}
+
 	// If BatchSize is set, execute in batches
 	if spec.BatchSize > 0 {
 		return executeBatchSpec(db, spec, start)
@@ -173,6 +184,99 @@ func executeSpec(db *sql.DB, spec SQLSpec) error {
 	}
 
 	log.Infof("Spec %s completed in %v", spec.Name, time.Since(start))
+	return nil
+}
+
+// executeQuerySpec runs a SELECT query and prints the result rows as a table
+func executeQuerySpec(db *sql.DB, spec SQLSpec, start time.Time) error {
+	rows, err := db.Query(spec.Query)
+	if err != nil {
+		return fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return fmt.Errorf("failed to get columns: %w", err)
+	}
+
+	// Collect all rows into string slices
+	var results [][]string
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		ptrs := make([]interface{}, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(ptrs...); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		row := make([]string, len(columns))
+		for i, v := range values {
+			if v == nil {
+				row[i] = "NULL"
+			} else {
+				row[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		results = append(results, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	if len(results) == 0 {
+		log.Infof("Spec %s: query returned 0 rows (no mismatches) in %v", spec.Name, time.Since(start))
+		return nil
+	}
+
+	// Compute column widths
+	widths := make([]int, len(columns))
+	for i, col := range columns {
+		widths[i] = len(col)
+	}
+	for _, row := range results {
+		for i, val := range row {
+			if len(val) > widths[i] {
+				widths[i] = len(val)
+			}
+		}
+	}
+
+	// Print header
+	fmt.Printf("\n--- %s: %d rows returned ---\n", spec.Name, len(results))
+	for i, col := range columns {
+		if i > 0 {
+			fmt.Print(" | ")
+		}
+		fmt.Printf("%-*s", widths[i], col)
+	}
+	fmt.Println()
+	for i, w := range widths {
+		if i > 0 {
+			fmt.Print("-+-")
+		}
+		for j := 0; j < w; j++ {
+			fmt.Print("-")
+		}
+	}
+	fmt.Println()
+
+	// Print rows
+	for _, row := range results {
+		for i, val := range row {
+			if i > 0 {
+				fmt.Print(" | ")
+			}
+			fmt.Printf("%-*s", widths[i], val)
+		}
+		fmt.Println()
+	}
+	fmt.Println()
+
+	log.Infof("Spec %s completed in %v (%d rows)", spec.Name, time.Since(start), len(results))
 	return nil
 }
 

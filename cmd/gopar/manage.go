@@ -199,6 +199,9 @@ func executeSQLSpecsStep(db *sql.DB, step StepConfig, dryRun bool) error {
 				fmt.Printf("Description: %s\n", spec.Description)
 			}
 			fmt.Printf("Concurrent: %v\n", spec.Concurrent)
+			if spec.ResultType != "" {
+				fmt.Printf("ResultType: %s\n", spec.ResultType)
+			}
 			fmt.Printf("Query:\n%s\n", spec.Query)
 			continue
 		}

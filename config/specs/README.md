@@ -77,6 +77,9 @@ Defines general SQL operations including migrations, function creation, and othe
 - `name` (string): Unique identifier for the spec
 - `description` (string): Human-readable description
 - `concurrent` (boolean): If `true`, runs outside a transaction (required for `CONCURRENTLY`)
+- `resultType` (string): Controls query execution mode (optional, default `"exec"`):
+  - `"exec"` — uses `db.Exec`, suitable for DDL/DML statements
+  - `"query"` — uses `db.Query` and prints returned rows as a formatted table, suitable for SELECT validation queries
 - `query` (string): SQL statement to execute
 
 ## Example Files

@@ -3,18 +3,21 @@
     "name": "validate_prow_job_run_tests_counts",
     "description": "Compare prow_job_run_tests row counts per day for last 14 days between original and _new table. Returns only mismatches.",
     "concurrent": true,
+    "resultType": "query",
     "query": "SELECT COALESCE(o.day, n.day) AS day, COALESCE(o.cnt, 0) AS original_count, COALESCE(n.cnt, 0) AS new_count, COALESCE(o.cnt, 0) - COALESCE(n.cnt, 0) AS diff FROM (SELECT DATE(prow_job_run_timestamp) AS day, COUNT(*) AS cnt FROM prow_job_run_tests WHERE prow_job_run_timestamp >= NOW() - INTERVAL '14 days' GROUP BY 1) o FULL OUTER JOIN (SELECT DATE(prow_job_run_timestamp) AS day, COUNT(*) AS cnt FROM prow_job_run_tests_new WHERE prow_job_run_timestamp >= NOW() - INTERVAL '14 days' GROUP BY 1) n ON o.day = n.day WHERE COALESCE(o.cnt, 0) != COALESCE(n.cnt, 0) ORDER BY 1"
   },
   {
     "name": "validate_prow_job_run_test_outputs_counts",
     "description": "Compare prow_job_run_test_outputs row counts per day for last 14 days between original and _new table. Returns only mismatches.",
     "concurrent": true,
+    "resultType": "query",
     "query": "SELECT COALESCE(o.day, n.day) AS day, COALESCE(o.cnt, 0) AS original_count, COALESCE(n.cnt, 0) AS new_count, COALESCE(o.cnt, 0) - COALESCE(n.cnt, 0) AS diff FROM (SELECT DATE(prow_job_run_test_timestamp) AS day, COUNT(*) AS cnt FROM prow_job_run_test_outputs WHERE prow_job_run_test_timestamp >= NOW() - INTERVAL '14 days' GROUP BY 1) o FULL OUTER JOIN (SELECT DATE(prow_job_run_test_timestamp) AS day, COUNT(*) AS cnt FROM prow_job_run_test_outputs_new WHERE prow_job_run_test_timestamp >= NOW() - INTERVAL '14 days' GROUP BY 1) n ON o.day = n.day WHERE COALESCE(o.cnt, 0) != COALESCE(n.cnt, 0) ORDER BY 1"
   },
   {
     "name": "validate_test_analysis_by_job_by_dates_counts",
     "description": "Compare test_analysis_by_job_by_dates row counts and aggregate values per day for last 14 days between original and _new table. Returns only mismatches.",
     "concurrent": true,
+    "resultType": "query",
     "query": "SELECT COALESCE(o.day, n.day) AS day, COALESCE(o.cnt, 0) AS original_count, COALESCE(n.cnt, 0) AS new_count, COALESCE(o.cnt, 0) - COALESCE(n.cnt, 0) AS count_diff, COALESCE(o.total_runs, 0) - COALESCE(n.total_runs, 0) AS runs_diff, COALESCE(o.total_passes, 0) - COALESCE(n.total_passes, 0) AS passes_diff FROM (SELECT DATE(date) AS day, COUNT(*) AS cnt, SUM(runs) AS total_runs, SUM(passes) AS total_passes FROM test_analysis_by_job_by_dates WHERE date >= NOW() - INTERVAL '14 days' GROUP BY 1) o FULL OUTER JOIN (SELECT DATE(date) AS day, COUNT(*) AS cnt, SUM(runs) AS total_runs, SUM(passes) AS total_passes FROM test_analysis_by_job_by_dates_new WHERE date >= NOW() - INTERVAL '14 days' GROUP BY 1) n ON o.day = n.day WHERE COALESCE(o.cnt, 0) != COALESCE(n.cnt, 0) OR COALESCE(o.total_runs, 0) != COALESCE(n.total_runs, 0) OR COALESCE(o.total_passes, 0) != COALESCE(n.total_passes, 0) ORDER BY 1"
   }
 ]
