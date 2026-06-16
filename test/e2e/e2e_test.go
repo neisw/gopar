@@ -8,7 +8,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/neisw/gopar/partitioning"
+	"github.com/openshift-eng/gopar/partitioning"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

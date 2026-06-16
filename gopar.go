@@ -3,7 +3,7 @@ package gopar
 import (
 	"database/sql"
 
-	"github.com/neisw/gopar/partitioning"
+	"github.com/openshift-eng/gopar/partitioning"
 )
 
 // DB wraps a database/sql connection and provides PostgreSQL partition management
@@ -24,7 +24,7 @@ type DB struct {
 //	import (
 //	    "database/sql"
 //	    _ "github.com/lib/pq"
-//	    "github.com/neisw/gopar"
+//	    "github.com/openshift-eng/gopar"
 //	)
 //
 //	// Connect to PostgreSQL

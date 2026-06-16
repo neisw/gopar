@@ -1,4 +1,4 @@
-module github.com/neisw/gopar
+module github.com/openshift-eng/gopar
 
 go 1.25.0
 
