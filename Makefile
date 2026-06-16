@@ -153,9 +153,7 @@ vet:
 
 ## lint: Run golangci-lint (requires golangci-lint installed)
 lint:
-	@echo "Running golangci-lint..."
-	@which golangci-lint > /dev/null || (echo "golangci-lint not found. Install: https://golangci-lint.run/usage/install/" && exit 1)
-	golangci-lint run ./...
+	./hack/go-lint.sh run ./...
 
 ## tidy: Tidy and verify go.mod
 tidy:
